@@ -69,7 +69,73 @@ def _label(ev: Event, multi: bool, server: str = "", login: str = "") -> str:
     return f"[{server} …{login[-4:]}] " if multi and login else ""
 
 
-def event_text(ev: Event, tz: ZoneInfo, cur: str = "USD", multi: bool = False) -> str:
+STARS = {1: "★", 2: "★★", 3: "★★★"}
+
+
+def fmt_duration(minutes: float) -> str:
+    m = int(minutes)
+    return f"{m // 60} ч {m % 60} мин" if m >= 60 else f"{m} мин"
+
+
+def _tfs_from_srcs(srcs: str) -> str:
+    found = [tf for tf in ("W1", "D1", "H4", "H1", "M15") if tf in srcs.split() or f"{tf} " in srcs or srcs.startswith(tf)]
+    return " · ".join(found + ["M5"])
+
+
+def trade_opened_text(d: dict, cur: str, status: Status | None) -> str:
+    """Шаблон из раздела 7 ТЗ. Строки, для которых нет данных, пропускаются."""
+    side = d.get("side", "")
+    n = ""
+    if status is not None:
+        day = status.get("day", default={}) or {}
+        if day.get("trades"):
+            n = f" · сделка {day['trades']}/{day.get('max_trades', '?')}"
+    head = f"{DIR_ICON.get(side, '')} {d.get('symbol', 'XAUUSD')} {side}" + (f" · {d['type']}" if d.get("type") else "") + n
+    sl_pts, tp_pts = d.get("sl_pts"), d.get("tp_pts")
+    sl_line = f"SL: {d.get('sl')}"
+    if sl_pts is not None:
+        sl_line += f" (−{sl_pts:g} pt" + (f", {d['sl_src']}" if d.get("sl_src") else "") + ")"
+    tp_line = f"TP: {d.get('tp')}"
+    if tp_pts is not None:
+        rr = d.get("rr") or (tp_pts / sl_pts if sl_pts else 0)
+        tp_line += f" (+{tp_pts:g} pt, RR 1:{rr:g})"
+    pct = f" ({d['risk_pct']:.1f}%)" if d.get("risk_pct") is not None else ""
+    lines = [head, f"Вход: {d.get('entry')}", sl_line, tp_line,
+             f"Лот {d.get('lot')} · риск {d.get('risk_usd', 0):.2f} {cur}{pct}"]
+    if d.get("zone_lo") is not None:
+        lines += ["", f"✅ Зона {d['zone_lo']:.2f}–{d['zone_hi']:.2f} · балл {d.get('score', '?')}"
+                  + (f" · {d['srcs']}" if d.get("srcs") else "")]
+    if d.get("trigger") and d["trigger"] != "MANUAL":
+        mark = f" ({d['mark']})" if d.get("mark") else ""
+        fu = f", FU класс {d['fu_class']}" if d.get("fu_class") not in (None, "", "-") else ""
+        lines.append(f"✅ Триггер {d['trigger']}{mark}{fu}")
+    if d.get("htf"):
+        lines.append("✅ HTF Re-test Level")
+    if d.get("zone_lo") is not None:
+        lines.append(f"ТФ: {_tfs_from_srcs(d.get('srcs', ''))} · сессия {d.get('session', '—')}")
+        lines.append(f"Сила сигнала: {STARS.get(int(d.get('strength') or 1), '★')}")
+    if d.get("weak"):
+        lines.append("⚠️ Слабый сигнал")
+    if d.get("manual"):
+        lines.append("✋ Ручная сделка из Telegram")
+    return "\n".join(lines)
+
+
+def trade_closed_text(d: dict, cur: str, status: Status | None) -> str:
+    ex = d.get("exit", "")
+    head = {"TP": "✅ TP", "SL": "🔴 SL", "BE": "⚪ BE", "MANUAL": "✋ Закрыто из Telegram"}.get(ex, f"⏹ {ex}")
+    lines = [f"{head} · {d.get('symbol', 'XAUUSD')} {d.get('side')} закрыта",
+             f"{d.get('entry')} → {d.get('exit_price')} · {d.get('pts', 0):+.1f} pt · {money(d.get('usd', 0.0), cur)}",
+             f"Длилась {fmt_duration(d.get('duration_min', 0))} · триггер {d.get('trigger', '—')}"]
+    if status is not None:
+        day = status.get("day", default={}) or {}
+        if day:
+            lines.append(f"День: {day.get('trades', 0)}/{day.get('max_trades', '?')} сделок · {day.get('pts', 0):+.1f} pt · "
+                         f"{money(day.get('usd', 0.0), cur)} · риска осталось {day.get('risk_left', 0):.2f} {cur}")
+    return "\n".join(lines)
+
+
+def event_text(ev: Event, tz: ZoneInfo, cur: str = "USD", multi: bool = False, status: Status | None = None) -> str:
     """Текст события робота. Шаблон есть для известных типов, иначе берётся `text` от робота."""
     d = ev.data
     t = ev.type
@@ -80,17 +146,9 @@ def event_text(ev: Event, tz: ZoneInfo, cur: str = "USD", multi: bool = False) -
         title = ALERT_TITLES.get(key, key)
         return ev.text if ev.text.startswith("🚨") else f"🚨 ТРЕВОГА: {title}\n{ev.text}".strip()
     if t == "trade_opened":
-        icon = DIR_ICON.get(d.get("side", ""), "")
-        manual = "\n✋ Ручная сделка из Telegram" if d.get("manual") else ""
-        return (f"{icon} {d.get('symbol', 'XAUUSD')} {d.get('side')} · {ev.text.split('·')[-1].strip() if '·' in ev.text else ''}\n"
-                f"Вход: {d.get('entry')}\nSL: {d.get('sl')}\nTP: {d.get('tp')}\n"
-                f"Лот {d.get('lot')} · риск {d.get('risk_usd', 0):.2f} {cur}{manual}").replace(" · \n", "\n")
+        return trade_opened_text(d, cur, status)
     if t == "trade_closed":
-        ex = d.get("exit", "")
-        head = {"TP": "✅ TP", "SL": "🔴 SL", "BE": "⚪ BE", "MANUAL": "✋ Закрыто из Telegram"}.get(ex, f"⏹ {ex}")
-        return (f"{head} · {d.get('side')} закрыта\n"
-                f"{d.get('entry')} → {d.get('exit_price')} · {d.get('pts', 0):+.1f} pt · {money(d.get('usd', 0.0), cur)}\n"
-                f"Длилась {d.get('duration_min', 0)} мин · триггер {d.get('trigger', '—')}")
+        return trade_closed_text(d, cur, status)
     if t == "trade_be":
         return f"⚪ Стоп перенесён в безубыток: {d.get('sl')}"
     if t == "trade_modified":

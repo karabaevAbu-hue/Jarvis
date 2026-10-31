@@ -8,19 +8,28 @@
 //|   новые триггеры F (FU из 3 свечей), S (пробой хая/лоя, книга),  |
 //|   HCS x2/x3, книга: 3 солдата / 3 вороны, повешенный, волчок.    |
 //|                                                                  |
+//|   v3.3: файловый мост с ассистентом (status.json, events, cmd),   |
+//|   таймер, команды из Telegram (после «да» ассистента), тревоги,  |
+//|   скрины, настройки g_set. Торговая логика не менялась.          |
+//|                                                                  |
 //|   Единицы: 1 пункт = $1 цены золота (пороги в ценовых единицах). |
 //|   Внутри паттерны и зоны считаются для BUY ("бычья логика");     |
 //|   для SELL цены зеркалятся (аксессоры Ov/Hv/Lv/Cv с d = -1).     |
 //+------------------------------------------------------------------+
 #property copyright "Consigliere"
-#property version   "3.20"
-#property description "Mr. Casino v3.2 (золото): зоны OB/FU/ликвидность -> манипуляция A-D, F, S + свечи из книги (K) -> стоп True Stop, тейк RR 1:2, 5 сделок в день, риск 5% в день"
+#property version   "3.30"
+#property description "Mr. Casino v3.3 (золото, мост с ассистентом): зоны OB/FU/ликвидность -> манипуляция A-D, F, S + свечи из книги (K) -> стоп True Stop, тейк RR 1:2, 5 сделок в день, риск 5% в день"
 
 #include <Trade\Trade.mqh>
 
 enum ENUM_RISK_MODE { RISK_FIXED = 0, RISK_PERCENT = 1, RISK_HALF = 2, RISK_FULL = 3 };
 enum ENUM_MIN_FU    { FU_CLASS_A = 3, FU_CLASS_B = 2, FU_CLASS_C = 1 };
 enum ENUM_TP_MODE   { TP_RR = 0, TP_LAL = 1 };
+
+//--- прототипы (мост v3.3, определены ниже)
+void Emit(string type, int level, string severity, string fields, string text, int shotTf);
+void WriteStatus();
+string BridgeLine();
 
 //--- входные параметры [§11]
 input group "Символ и метка"
@@ -129,10 +138,23 @@ input int             InpNewsMinutes    = 30;           // Окно вокруг
 input group "Лог, график, уведомления [§10]"
 input int             InpLogLevel       = 1;            // 0 сделки, 1 зоны и пропуски, 2 подробно
 input bool            InpPush           = true;         // Push в MT5 на iPhone
-input string          InpTgToken        = "";           // Telegram bot token
-input string          InpTgChatId       = "";           // Telegram chat id
+input string          InpTgToken        = "";           // Telegram bot token (только запасной канал)
+input string          InpTgChatId       = "";           // Telegram chat id (только запасной канал)
 input bool            InpDraw           = true;         // Рисовать зоны на графике
 input string          InpLogFile        = "MrCasino_v32_trades.csv"; // CSV-лог (MQL5/Files)
+
+input group "Telegram-бот (мост) [v3.3]"
+input bool            InpBridge         = true;         // Вести файловый мост (status, events, команды)
+input string          InpBridgeKey      = "";           // Секрет команд; пусто = команды не принимаются
+input int             InpStatusSec      = 10;           // Как часто обновлять status.json, секунд
+input bool            InpShots          = true;         // Скрины графика к событиям
+input int             InpShotW          = 1280;         // Ширина скрина, пикселей
+input int             InpShotH          = 720;          // Высота скрина, пикселей
+input string          InpMorningHM      = "09:30";      // Утренний брифинг (Бишкек), пусто = выкл
+input string          InpReportHM       = "23:05";      // Дневной отчёт (Бишкек), пусто = выкл
+input bool            InpTgFallback     = true;         // Бот молчит > 3 мин: критичное напрямую в Telegram
+input double          InpAlertDDPct     = 3.0;          // Тревога: эквити ниже баланса начала дня на N%
+input double          InpAlertSpreadX   = 3.0;          // Тревога: спред > N × макс. спреда дольше 2 минут
 
 //--- робот только для золота: 1 пункт = $1, множители = 1
 double     g_k      = 1.0;
@@ -172,6 +194,7 @@ bool       g_crypto = false;
 #define T_COUNTER       2
 #define T_NEUTRAL       3
 #define OBJ_PREFIX      "MC_"
+#define TRADES_HEADER   "date_open,date_close,ticket,side,type,trigger,mark,fu_class,score,zone_sources,zone_width,session,entry,sl,tp,lot,risk_usd,result_pts,result_usd,rr_real,exit,strength,weak,manual,duration_min"
 
 //--- структуры
 struct SCand                       // кандидат в зону, зеркальные координаты
@@ -202,6 +225,7 @@ struct SZone
    bool              hasHCS;
    bool              tradable;
    bool              notified;
+   bool              touched;      // v3.3: цена уже заходила в зону (событие zone_touch)
    string            srcs;
    int               nLvl;
    double            lvl[6];       // реальные цены снятой ликвидности
@@ -231,6 +255,25 @@ struct SDay
    int               lossStreak;
    datetime          lastLossBuy;
    datetime          lastLossSell;
+  };
+
+// Настройки, которые можно менять из Telegram [v3.3, §5.4]; c* = значение изменено из Telegram
+struct SSet
+  {
+   bool              paused;
+   double            riskPct;       // < 0: риск в день / сделок в день
+   double            dailyRiskPct;
+   int               maxTrades;
+   double            rr;
+   bool              weak;
+   bool              tradeBuy;
+   bool              tradeSell;
+   bool              cRisk;
+   bool              cDaily;
+   bool              cMax;
+   bool              cRr;
+   bool              cWeak;
+   bool              cSide;
   };
 
 //--- глобальные переменные
@@ -264,6 +307,34 @@ int        g_cntToday   = 0;
 int        g_quotaMin   = 0;        // начало добора, минуты Бишкека
 int        g_rebuildId  = 0;
 
+// мост v3.3
+SSet       g_set;
+string     g_pauseReason  = "";
+int        g_rejectStreak = 0;
+string     g_robotId      = "";
+string     g_dir          = "";        // MrCasino\<login>_<magic> в Common\Files
+long       g_seq          = 0;
+bool       g_bridgeOn     = false;
+bool       g_botAlive     = false;
+datetime   g_botHb        = 0;         // heartbeat бота, UTC
+datetime   g_startUtc     = 0;
+bool       g_fallback     = false;     // бот молчит > 3 минут
+string     g_tgQueue[];
+string     g_alKey[];
+bool       g_alOn[];
+datetime   g_discSince    = 0;
+datetime   g_spreadSince  = 0;
+ulong      g_lastTickMs   = 0;
+ulong      g_lastStatusMs = 0;
+ulong      g_lastAlertMs  = 0;
+string     g_lastMorningDay = "";
+string     g_lastReportDay  = "";
+int        g_noSlTries    = 0;
+datetime   g_noSlLast     = 0;
+bool       g_biasInit     = false;
+bool       g_zoneCreating = false;   // зона создаётся: zone_invalid не шлём
+bool       g_sigThisPass  = false;   // в этом проходе TryEntry триггер уже был (для signal_skipped)
+
 // открытая позиция робота
 long       g_pId        = 0;
 int        g_pDir       = 0;
@@ -288,6 +359,11 @@ bool       g_beDone     = false;
 bool       g_partDone   = false;
 string     g_exitTag    = "";
 int        g_closeRetry = 0;
+datetime   g_pOpenT     = 0;
+string     g_pMark      = "";
+bool       g_pManual    = false;
+bool       g_pWeak      = false;
+int        g_pStrN      = 1;
 
 //+------------------------------------------------------------------+
 //| Лог и уведомления [§10]                                          |
@@ -340,17 +416,9 @@ void SendTG(string text)
       Print("Telegram: ошибка отправки, код ", code, ", err ", GetLastError());
   }
 
-void Notify(string text)
+void Notify(string text)               // v3.3: обычное сообщение идёт событием, прямой Telegram только в запасном режиме
   {
-   Print("[NOTIFY] ", text);
-   SendTG(text);
-   if(InpPush && !g_isTester)
-     {
-      string p = text;
-      StringReplace(p, "\n", " | ");
-      if(StringLen(p) > 250) p = StringSubstr(p, 0, 250);
-      if(!SendNotification(p)) Print("Push: ошибка ", GetLastError());
-     }
+   Emit("note", 1, "info", "", text, -1);
   }
 
 void LogTrade(string line)
@@ -518,9 +586,9 @@ bool InSession()
 // иначе — добор после InpQuotaFrom, если сделок меньше лимита. Зона и сигнал нужны всегда.
 bool Relaxed()
   {
-   if(g_day.trades >= InpMaxTradesDay) return false;
+   if(g_day.trades >= g_set.maxTrades) return false;
    if(!InSession()) return false;
-   if(InpWeakSignals) return true;
+   if(g_set.weak) return true;
    return InpQuota && LocalMinutes() >= g_quotaMin;
   }
 
@@ -583,6 +651,469 @@ bool FridayCloseTime()
   }
 
 //+------------------------------------------------------------------+
+//| Мост с ассистентом v3.3 [§5, §6]: JSON, файлы, события, настройки|
+//+------------------------------------------------------------------+
+string IsoUtc(datetime t)
+  {
+   MqlDateTime m;
+   TimeToStruct(t, m);
+   return StringFormat("%04d-%02d-%02dT%02d:%02d:%02dZ", m.year, m.mon, m.day, m.hour, m.min, m.sec);
+  }
+
+string LocalStamp(datetime loc)                 // loc уже в часовом поясе Бишкека
+  {
+   MqlDateTime m;
+   TimeToStruct(loc, m);
+   return StringFormat("%04d-%02d-%02d %02d:%02d:%02d", m.year, m.mon, m.day, m.hour, m.min, m.sec);
+  }
+
+string LocalDayKey(datetime loc)
+  {
+   MqlDateTime m;
+   TimeToStruct(loc, m);
+   return StringFormat("%04d%02d%02d", m.year, m.mon, m.day);
+  }
+
+datetime IsoToTime(string s)                    // "2026-11-02T08:15:10Z" -> datetime (UTC)
+  {
+   if(StringLen(s) < 19) return 0;
+   string d = StringSubstr(s, 0, 4) + "." + StringSubstr(s, 5, 2) + "." + StringSubstr(s, 8, 2) + " " + StringSubstr(s, 11, 8);
+   return StringToTime(d);
+  }
+
+string JEsc(string s)
+  {
+   StringReplace(s, "\\", "\\\\");
+   StringReplace(s, "\"", "\\\"");
+   StringReplace(s, "\r", "");
+   StringReplace(s, "\n", "\\n");
+   StringReplace(s, "\t", " ");
+   return s;
+  }
+
+string JS(string key, string v) { return "\"" + key + "\":\"" + JEsc(v) + "\""; }
+string JN(string key, double v, int digits)
+  {
+   if(!MathIsValidNumber(v) || MathAbs(v) > 1.0e12) v = 0.0;
+   return "\"" + key + "\":" + DoubleToString(v, digits);
+  }
+string JI(string key, long v) { return "\"" + key + "\":" + IntegerToString(v); }
+string JB(string key, bool v) { return "\"" + key + "\":" + (v ? "true" : "false"); }
+
+// Разбор JSON-объекта в плоские пары. Вложенные объекты дают ключи вида "args.pct".
+// Значения: строки (с разэкранированием), числа, true/false как текст. Массивы не поддерживаются.
+void JAdd(string &keys[], string &vals[], const string &path[], string key, string val)
+  {
+   string full = "";
+   for(int q = 0; q < ArraySize(path); q++) full += path[q] + ".";
+   full += key;
+   int k = ArraySize(keys);
+   ArrayResize(keys, k + 1);
+   ArrayResize(vals, k + 1);
+   keys[k] = full;
+   vals[k] = val;
+  }
+
+int JParse(const string s, string &keys[], string &vals[])
+  {
+   ArrayResize(keys, 0);
+   ArrayResize(vals, 0);
+   string path[];
+   ArrayResize(path, 0);
+   string pending = "";
+   int n = StringLen(s);
+   int i = 0;
+   while(i < n)
+     {
+      ushort c = StringGetCharacter(s, i);
+      if(c == '{')
+        {
+         if(pending != "")
+           {
+            int d = ArraySize(path);
+            ArrayResize(path, d + 1);
+            path[d] = pending;
+            pending = "";
+           }
+         i++;
+        }
+      else if(c == '}')
+        {
+         int d = ArraySize(path);
+         if(d > 0) ArrayResize(path, d - 1);
+         i++;
+        }
+      else if(c == '"')
+        {
+         string str = "";
+         i++;
+         while(i < n)
+           {
+            ushort ch = StringGetCharacter(s, i);
+            if(ch == '\\' && i + 1 < n)
+              {
+               ushort nx = StringGetCharacter(s, i + 1);
+               if(nx == 'n') str += "\n";
+               else if(nx == 't') str += " ";
+               else str += ShortToString(nx);
+               i += 2;
+              }
+            else if(ch == '"') { i++; break; }
+            else { str += ShortToString(ch); i++; }
+           }
+         int j = i;
+         while(j < n && (StringGetCharacter(s, j) == ' ' || StringGetCharacter(s, j) == '\r' ||
+                         StringGetCharacter(s, j) == '\n' || StringGetCharacter(s, j) == '\t')) j++;
+         if(pending == "" && j < n && StringGetCharacter(s, j) == ':')
+           {
+            pending = str;
+            i = j + 1;
+           }
+         else if(pending != "")
+           {
+            JAdd(keys, vals, path, pending, str);
+            pending = "";
+           }
+        }
+      else if(c == ',' || c == ' ' || c == '\r' || c == '\n' || c == '\t' || c == ':')
+         i++;
+      else
+        {
+         string tok = "";
+         while(i < n)
+           {
+            ushort ch = StringGetCharacter(s, i);
+            if(ch == ',' || ch == '}' || ch == ' ' || ch == '\r' || ch == '\n' || ch == '\t') break;
+            tok += ShortToString(ch);
+            i++;
+           }
+         if(pending != "")
+           {
+            JAdd(keys, vals, path, pending, tok);
+            pending = "";
+           }
+        }
+     }
+   return ArraySize(keys);
+  }
+
+bool JHas(const string &keys[], string key)
+  {
+   for(int i = 0; i < ArraySize(keys); i++)
+      if(keys[i] == key) return true;
+   return false;
+  }
+
+string JGet(const string &keys[], const string &vals[], string key, string def = "")
+  {
+   for(int i = 0; i < ArraySize(keys); i++)
+      if(keys[i] == key) return vals[i];
+   return def;
+  }
+
+//--- файлы моста (общая папка Common\Files, UTF-8 без BOM) [§6]
+void EnsureDirs()
+  {
+   FolderCreate("MrCasino", FILE_COMMON);
+   FolderCreate(g_dir, FILE_COMMON);
+   FolderCreate(g_dir + "\\events", FILE_COMMON);
+   FolderCreate(g_dir + "\\cmd", FILE_COMMON);
+   FolderCreate(g_dir + "\\shots", FILE_COMMON);
+  }
+
+// Атомарная запись: во временный файл, затем переименование с перезаписью
+bool WriteAtomic(string rel, string text)
+  {
+   string tmp = rel + ".tmp";
+   int h = FileOpen(tmp, FILE_WRITE | FILE_BIN | FILE_COMMON);
+   if(h == INVALID_HANDLE) return false;
+   uchar b[];
+   int n = StringToCharArray(text, b, 0, WHOLE_ARRAY, CP_UTF8);
+   if(n > 1) FileWriteArray(h, b, 0, n - 1);          // без завершающего нуля
+   FileClose(h);
+   return FileMove(tmp, FILE_COMMON, rel, FILE_REWRITE | FILE_COMMON);
+  }
+
+// Дозапись строки в конец файла; header пишется, если файл пуст
+bool AppendUtf8(string rel, string text, string header)
+  {
+   int h = FileOpen(rel, FILE_READ | FILE_WRITE | FILE_BIN | FILE_COMMON | FILE_SHARE_READ | FILE_SHARE_WRITE);
+   if(h == INVALID_HANDLE) return false;
+   ulong sz = FileSize(h);
+   FileSeek(h, 0, SEEK_END);
+   uchar b[];
+   if(sz == 0 && header != "")
+     {
+      int nh = StringToCharArray(header + "\n", b, 0, WHOLE_ARRAY, CP_UTF8);
+      if(nh > 1) FileWriteArray(h, b, 0, nh - 1);
+     }
+   int n = StringToCharArray(text + "\n", b, 0, WHOLE_ARRAY, CP_UTF8);
+   if(n > 1) FileWriteArray(h, b, 0, n - 1);
+   FileClose(h);
+   return true;
+  }
+
+bool ReadUtf8(string rel, string &out)
+  {
+   out = "";
+   int h = FileOpen(rel, FILE_READ | FILE_BIN | FILE_COMMON | FILE_SHARE_READ | FILE_SHARE_WRITE);
+   if(h == INVALID_HANDLE) return false;
+   int sz = (int)FileSize(h);
+   uchar b[];
+   if(sz > 0)
+     {
+      ArrayResize(b, sz);
+      FileReadArray(h, b, 0, sz);
+      out = CharArrayToString(b, 0, sz, CP_UTF8);
+     }
+   FileClose(h);
+   return true;
+  }
+
+//--- настройки, меняющиеся из Telegram [§5.4]
+void SettingsFromInputs()
+  {
+   g_set.paused = false;
+   g_set.riskPct = InpRiskPercent > 0 ? InpRiskPercent : -1.0;     // < 0: риск в день / сделок в день
+   g_set.dailyRiskPct = InpDailyRiskPct;
+   g_set.maxTrades = InpMaxTradesDay;
+   g_set.rr = InpRR;
+   g_set.weak = InpWeakSignals;
+   g_set.tradeBuy = InpTradeBuy;
+   g_set.tradeSell = InpTradeSell;
+   g_set.cRisk = false;
+   g_set.cDaily = false;
+   g_set.cMax = false;
+   g_set.cRr = false;
+   g_set.cWeak = false;
+   g_set.cSide = false;
+  }
+
+void SaveSettings()
+  {
+   if(!g_bridgeOn) return;
+   string st = "";
+   if(g_set.cRisk) st += (st == "" ? "" : ",") + JN("risk_pct", g_set.riskPct, 2);
+   if(g_set.cDaily) st += (st == "" ? "" : ",") + JN("daily_risk_pct", g_set.dailyRiskPct, 2);
+   if(g_set.cMax) st += (st == "" ? "" : ",") + JI("max_trades", g_set.maxTrades);
+   if(g_set.cRr) st += (st == "" ? "" : ",") + JN("rr", g_set.rr, 2);
+   if(g_set.cWeak) st += (st == "" ? "" : ",") + JB("weak", g_set.weak);
+   if(g_set.cSide) st += (st == "" ? "" : ",") + JB("buy", g_set.tradeBuy) + "," + JB("sell", g_set.tradeSell);
+   if(g_set.paused) st += (st == "" ? "" : ",") + JB("paused", true) + "," + JS("pause_reason", g_pauseReason);
+   string s = "{" + JI("seq", g_seq) + ",\"settings\":{" + st + "}," + JS("morning_day", g_lastMorningDay) + "," +
+              JS("report_day", g_lastReportDay) + "}";
+   WriteAtomic(g_dir + "\\settings.json", s);
+  }
+
+void LoadSettings()
+  {
+   string t;
+   if(!ReadUtf8(g_dir + "\\settings.json", t) || t == "") return;
+   string k[], v[];
+   JParse(t, k, v);
+   g_seq = StringToInteger(JGet(k, v, "seq", "0"));
+   g_lastMorningDay = JGet(k, v, "morning_day");
+   g_lastReportDay = JGet(k, v, "report_day");
+   if(JHas(k, "settings.risk_pct"))
+     { g_set.riskPct = StringToDouble(JGet(k, v, "settings.risk_pct")); g_set.cRisk = true; }
+   if(JHas(k, "settings.daily_risk_pct"))
+     { g_set.dailyRiskPct = StringToDouble(JGet(k, v, "settings.daily_risk_pct")); g_set.cDaily = true; }
+   if(JHas(k, "settings.max_trades"))
+     { g_set.maxTrades = (int)StringToInteger(JGet(k, v, "settings.max_trades")); g_set.cMax = true; }
+   if(JHas(k, "settings.rr"))
+     { g_set.rr = StringToDouble(JGet(k, v, "settings.rr")); g_set.cRr = true; }
+   if(JHas(k, "settings.weak"))
+     { g_set.weak = (JGet(k, v, "settings.weak") == "true"); g_set.cWeak = true; }
+   if(JHas(k, "settings.buy") && JHas(k, "settings.sell"))
+     {
+      g_set.tradeBuy = (JGet(k, v, "settings.buy") == "true");
+      g_set.tradeSell = (JGet(k, v, "settings.sell") == "true");
+      g_set.cSide = true;
+     }
+   if(JGet(k, v, "settings.paused") == "true")
+     { g_set.paused = true; g_pauseReason = JGet(k, v, "settings.pause_reason", "Telegram"); }
+  }
+
+//--- торговая сессия символа открыта (по расписанию брокера, серверное время)
+bool SymbolSessionOpen()
+  {
+   MqlDateTime t;
+   TimeToStruct(TimeCurrent(), t);
+   int now = t.hour * 3600 + t.min * 60 + t.sec;
+   datetime from, to;
+   for(uint k = 0; SymbolInfoSessionTrade(g_sym, (ENUM_DAY_OF_WEEK)t.day_of_week, k, from, to); k++)
+      if(now >= (int)from && now < (int)to) return true;
+   return false;
+  }
+
+//--- скрины графика [§5.7]
+void CopyChartObjects(long cid)
+  {
+   int total = ObjectsTotal(0, 0, OBJ_RECTANGLE);
+   for(int i = 0; i < total; i++)
+     {
+      string nm = ObjectName(0, i, 0, OBJ_RECTANGLE);
+      if(StringFind(nm, OBJ_PREFIX + "Z") != 0) continue;
+      datetime t1 = (datetime)ObjectGetInteger(0, nm, OBJPROP_TIME, 0);
+      datetime t2 = (datetime)ObjectGetInteger(0, nm, OBJPROP_TIME, 1);
+      double p1 = ObjectGetDouble(0, nm, OBJPROP_PRICE, 0);
+      double p2 = ObjectGetDouble(0, nm, OBJPROP_PRICE, 1);
+      if(!ObjectCreate(cid, nm, OBJ_RECTANGLE, 0, t1, p1, t2, p2)) continue;
+      ObjectSetInteger(cid, nm, OBJPROP_COLOR, ObjectGetInteger(0, nm, OBJPROP_COLOR));
+      ObjectSetInteger(cid, nm, OBJPROP_FILL, ObjectGetInteger(0, nm, OBJPROP_FILL));
+      ObjectSetInteger(cid, nm, OBJPROP_BACK, true);
+     }
+   string lines[2] = {"SL", "TP"};
+   for(int q = 0; q < 2; q++)
+     {
+      string nm = OBJ_PREFIX + lines[q];
+      if(ObjectFind(0, nm) < 0) continue;
+      if(!ObjectCreate(cid, nm, OBJ_HLINE, 0, 0, ObjectGetDouble(0, nm, OBJPROP_PRICE))) continue;
+      ObjectSetInteger(cid, nm, OBJPROP_COLOR, ObjectGetInteger(0, nm, OBJPROP_COLOR));
+      ObjectSetInteger(cid, nm, OBJPROP_STYLE, STYLE_DASH);
+     }
+  }
+
+// M5 (и текущий график): ChartScreenShot прямо с графика робота. Другие ТФ: временный график,
+// на него копируются зоны, скрин, закрытие. Только из OnTimer (там можно ждать подгрузку истории).
+bool TakeShot(ENUM_TIMEFRAMES tf, string name)
+  {
+   string tmp = "MrCasino_shot.png";
+   long cid = ChartID();
+   long tmpChart = 0;
+   if(tf != PERIOD_M5 && tf != _Period)
+     {
+      tmpChart = ChartOpen(g_sym, tf);
+      if(tmpChart == 0) return false;
+      CopyChartObjects(tmpChart);
+      for(int k = 0; k < 10; k++)
+        {
+         if(ChartGetInteger(tmpChart, CHART_VISIBLE_BARS) > 0) break;
+         Sleep(200);
+        }
+      ChartRedraw(tmpChart);
+      Sleep(300);
+      cid = tmpChart;
+     }
+   else
+      ChartRedraw(cid);
+   FileDelete(tmp);
+   bool ok = ChartScreenShot(cid, tmp, InpShotW, InpShotH, ALIGN_RIGHT);
+   if(tmpChart != 0) ChartClose(tmpChart);
+   if(!ok) return false;
+   return FileMove(tmp, 0, g_dir + "\\shots\\" + name, FILE_COMMON | FILE_REWRITE);
+  }
+
+//--- запасной канал Telegram: очередь, отправка только из OnTimer (в OnTick сети нет) [§5.3]
+void QueueTG(string text)
+  {
+   int n = ArraySize(g_tgQueue);
+   if(n >= 20) return;
+   ArrayResize(g_tgQueue, n + 1);
+   g_tgQueue[n] = text;
+  }
+
+void DrainTG()
+  {
+   int n = ArraySize(g_tgQueue);
+   if(n == 0) return;
+   string t = g_tgQueue[0];
+   for(int i = 1; i < n; i++) g_tgQueue[i - 1] = g_tgQueue[i];
+   ArrayResize(g_tgQueue, n - 1);
+   SendTG(t);
+  }
+
+void PushMT5(string text)
+  {
+   if(!InpPush || g_isTester) return;
+   string p = text;
+   StringReplace(p, "\n", " | ");
+   if(StringLen(p) > 250) p = StringSubstr(p, 0, 250);
+   if(!SendNotification(p)) Print("Push: ошибка ", GetLastError());
+  }
+
+//--- Emit: событие в ленту, status.json, Push; запасной Telegram [§5.3, §7]
+// fields — содержимое объекта data без фигурных скобок; shotTf >= 0 — приложить скрин (PERIOD_M5 = график робота)
+void Emit(string type, int level, string severity, string fields, string text, int shotTf)
+  {
+   g_seq++;
+   if(level <= 0 || type == "zone_confirmed") Print("[NOTIFY] ", text);
+   if(g_bridgeOn)
+     {
+      string data = fields;
+      if(shotTf >= 0)
+        {
+         string shot = "";
+         if(InpShots)
+           {
+            string nm = IntegerToString(g_seq) + ".png";
+            if(TakeShot((ENUM_TIMEFRAMES)shotTf, nm)) shot = nm;
+           }
+         data += (data == "" ? "" : ",") + JS("shot", shot);
+        }
+      string line = "{" + JI("seq", g_seq) + "," + JS("ts_utc", IsoUtc(TimeGMT())) + "," + JS("ts_local", LocalStamp(LocalNow())) + "," +
+                    JS("type", type) + "," + JI("level", level) + "," + JS("severity", severity) + "," + JS("robot", g_robotId) +
+                    ",\"data\":{" + data + "}," + JS("text", text) + "}";
+      if(!AppendUtf8(g_dir + "\\events\\" + LocalDayKey(LocalNow()) + ".jsonl", line, ""))
+         Print("Мост: не записать событие ", type, ", err ", GetLastError());
+      SaveSettings();
+      WriteStatus();
+     }
+   if((level <= 0 && type != "cmd_result" && type != "ea_started" && type != "ea_stopped") || type == "zone_confirmed")
+      PushMT5(text);
+   if(g_fallback && InpTgFallback && (severity == "critical" || type == "trade_opened" || type == "trade_closed"))
+      QueueTG(text);
+  }
+
+void EmitBias(string tf, int from, int to)
+  {
+   Emit("bias_changed", 1, "info", JS("tf", tf) + "," + JS("from", BiasName(from)) + "," + JS("to", BiasName(to)),
+        "🔄 Bias " + tf + ": " + BiasName(from) + " → " + BiasName(to), -1);
+  }
+
+//--- тревоги: событие alert один раз на начало и один раз на конец [§5.8]
+void AlertSet(string key, bool on, string severity, string text)
+  {
+   int idx = -1;
+   for(int i = 0; i < ArraySize(g_alKey); i++)
+      if(g_alKey[i] == key) { idx = i; break; }
+   if(idx < 0)
+     {
+      idx = ArraySize(g_alKey);
+      ArrayResize(g_alKey, idx + 1);
+      ArrayResize(g_alOn, idx + 1);
+      g_alKey[idx] = key;
+      g_alOn[idx] = false;
+     }
+   if(g_alOn[idx] == on) return;
+   g_alOn[idx] = on;
+   Emit("alert", 0, severity, JS("key", key) + "," + JS("state", on ? "open" : "closed") + "," + JS("severity", severity), text, -1);
+  }
+
+bool AlertIsOn(string key)
+  {
+   for(int i = 0; i < ArraySize(g_alKey); i++)
+      if(g_alKey[i] == key) return g_alOn[i];
+   return false;
+  }
+
+// Отказ ордера: одиночный — событие order_rejected; 3 подряд — автопауза и критичная тревога [§5.5]
+void RegisterReject(uint rc, string descr, string trig)
+  {
+   g_rejectStreak++;
+   Emit("order_rejected", 0, "warning", JI("retcode", (long)rc) + "," + JS("descr", descr) + "," + JS("trigger", trig),
+        StringFormat("⚠️ Ордер отклонён: %u %s (триггер %s)", rc, descr, trig), -1);
+   if(g_rejectStreak >= 3 && !g_set.paused)
+     {
+      g_set.paused = true;
+      g_pauseReason = "автопауза: 3 отказа ордеров подряд";
+      SaveSettings();
+      AlertSet("orders_rejected", true, "critical",
+               "3 отказа ордеров подряд. Робот поставлен на паузу. Последний отказ: " + descr + ". Снять паузу можно командой resume.");
+     }
+  }
+
+//+------------------------------------------------------------------+
 //| Bias и тип сделки [§4]                                           |
 //+------------------------------------------------------------------+
 int CalcBias(ENUM_TIMEFRAMES tf)
@@ -604,8 +1135,15 @@ int CalcBias(ENUM_TIMEFRAMES tf)
 
 void UpdateBias()
   {
+   int o1 = g_d1, o4 = g_h4;
    g_d1 = CalcBias(PERIOD_D1);
    g_h4 = CalcBias(PERIOD_H4);
+   if(g_biasInit)
+     {
+      if(g_d1 != o1) EmitBias("D1", o1, g_d1);
+      if(g_h4 != o4) EmitBias("H4", o4, g_h4);
+     }
+   g_biasInit = true;
   }
 
 int TradeType(int d)
@@ -825,8 +1363,8 @@ double ChooseTP(int d, double entry, double dist, string &src)
       if(dd < best) { best = dd; src = cn[k]; }
      }
    if(best < DBL_MAX) return best;
-   double fb = MathMin(InpTPMax, MathMax(InpTPMin, InpRR * dist));
-   src = StringFormat("целей нет — стоп × %.1f", InpRR);
+   double fb = MathMin(InpTPMax, MathMax(InpTPMin, g_set.rr * dist));
+   src = StringFormat("целей нет — стоп × %.1f", g_set.rr);
    return fb;
   }
 
@@ -849,6 +1387,9 @@ void SetStatus(SZone &z, int ns, string why = "")
    string old = StatusName(z.status);
    z.status = ns;
    Lg(1, ZoneLine(z) + " | " + old + "→" + StatusName(ns) + (why != "" ? " (" + why + ")" : ""));
+   if(ns == ZONE_INVALID && !g_zoneCreating)
+      Emit("zone_invalid", 2, "info", JS("dir", DirName(z.dir)) + "," + JN("lo", z.lo, g_digits) + "," + JN("hi", z.hi, g_digits) + "," +
+           JS("why", why), "✖ Зона снята: " + ZoneTag(z) + (why != "" ? " (" + why + ")" : ""), -1);
   }
 
 long LifeSec(ENUM_TIMEFRAMES tf)
@@ -914,8 +1455,10 @@ void ZoneNotify(SZone &z)
   {
    if(z.status != ZONE_CONFIRMED || z.notified) return;
    z.notified = true;
-   Notify(StringFormat("%s: зона CONFIRMED\n%s–%s (%.1f pt) · балл %d\n%s",
-                       DirName(z.dir), Px(z.lo), Px(z.hi), z.hi - z.lo, z.score, z.srcs));
+   Emit("zone_confirmed", 1, "info", JS("dir", DirName(z.dir)) + "," + JN("lo", z.lo, g_digits) + "," + JN("hi", z.hi, g_digits) + "," +
+        JN("width", z.hi - z.lo, 1) + "," + JI("score", z.score) + "," + JS("srcs", z.srcs) + "," + JB("htf", z.htf),
+        StringFormat("%s Зона %s %s–%s CONFIRMED · балл %d · %s", z.dir > 0 ? "🟩" : "🟥", DirName(z.dir), Px(z.lo), Px(z.hi),
+                     z.score, z.srcs), -1);
   }
 
 // Участок региона, где перекрывается больше всего теней FU (первый снизу при равенстве)
@@ -1203,6 +1746,7 @@ void UpsertGroup(int d, SCand &c[], int &mem[], int ai, double glo, double ghi)
       g_zones[idx].dir = d;
       g_zones[idx].hasHCS = false;
       g_zones[idx].notified = false;
+      g_zones[idx].touched = false;
       g_zones[idx].lastSkip = "";
       g_zones[idx].lastSkipT = 0;
       g_zones[idx].status = ZONE_NEW;
@@ -1234,7 +1778,9 @@ void UpsertGroup(int d, SCand &c[], int &mem[], int ai, double glo, double ghi)
    int bonus = (g_zones[idx].htf ? 1 : 0) + (ZoneInFVG(g_zones[idx].lo, g_zones[idx].hi) ? -2 : 0) +
                (g_zones[idx].hasHCS ? 2 : 0);
    g_zones[idx].score = srcScore + bonus;
+   g_zoneCreating = isNew;                       // при создании зоны событие zone_invalid не шлём
    if(rangeChanged) ReplayZone(g_zones[idx]);
+   g_zoneCreating = false;
    if(isNew)
      {
       if(g_zones[idx].status == ZONE_INVALID)
@@ -1285,7 +1831,7 @@ void RebuildZones()
    for(int s = 0; s < 2; s++)
      {
       int d = s == 0 ? 1 : -1;
-      if((d > 0 && !InpTradeBuy) || (d < 0 && !InpTradeSell)) continue;
+      if((d > 0 && !g_set.tradeBuy) || (d < 0 && !g_set.tradeSell)) continue;
       FindHTFLevels(d);
       SCand c[];
       ArrayResize(c, 0);
@@ -1819,8 +2365,8 @@ double TradeRiskPct(ENUM_RISK_MODE mode)
   {
    if(mode == RISK_HALF) return 50.0;
    if(mode == RISK_FULL) return 100.0;
-   if(InpRiskPercent > 0) return InpRiskPercent;
-   if(InpDailyRiskPct > 0 && InpMaxTradesDay > 0) return InpDailyRiskPct / InpMaxTradesDay;
+   if(g_set.riskPct > 0) return g_set.riskPct;                       // задан явно (входной параметр или Telegram)
+   if(g_set.dailyRiskPct > 0 && g_set.maxTrades > 0) return g_set.dailyRiskPct / g_set.maxTrades;
    return 1.0;
   }
 
@@ -1833,14 +2379,14 @@ double DayStartBalance()
 // Остаток дневного риска в валюте счёта: InpDailyRiskPct от баланса начала дня минус убыток дня
 double DailyRiskLeft()
   {
-   if(InpDailyRiskPct <= 0) return DBL_MAX;
-   return DayStartBalance() * InpDailyRiskPct / 100.0 - MathMax(0.0, -g_day.usd);
+   if(g_set.dailyRiskPct <= 0) return DBL_MAX;
+   return DayStartBalance() * g_set.dailyRiskPct / 100.0 - MathMax(0.0, -g_day.usd);
   }
 
 // Лот [§2]: по риску на сделку, но не больше остатка дневного риска. Если лот по риску меньше
 // минимального — минимальный лот, когда он влезает в дневной риск (InpMinLotIfFits).
 // Возвращает 0 и причину в why, если сделку открыть нельзя; riskUsd — риск сделки в валюте счёта.
-double CalcLot(double slDist, int d, double entry, double &riskUsd, string &why)
+double CalcLot(double slDist, int d, double entry, double &riskUsd, string &why, double riskOverride = -1.0)
   {
    riskUsd = 0;
    why = "";
@@ -1858,11 +2404,11 @@ double CalcLot(double slDist, int d, double entry, double &riskUsd, string &why)
    else
      {
       if(lossPerLot <= 0) { why = "нет стоимости тика от брокера"; return 0; }
-      lot = AccountInfoDouble(ACCOUNT_BALANCE) * TradeRiskPct(mode) / 100.0 / lossPerLot;
+      lot = AccountInfoDouble(ACCOUNT_BALANCE) * (riskOverride > 0 ? riskOverride : TradeRiskPct(mode)) / 100.0 / lossPerLot;
      }
    lot = MathFloor(lot / step + 1e-9) * step;
    double capLot = DBL_MAX;
-   if(InpDailyRiskPct > 0 && lossPerLot > 0)
+   if(g_set.dailyRiskPct > 0 && lossPerLot > 0)
       capLot = MathFloor(DailyRiskLeft() / lossPerLot / step + 1e-6) * step;
    lot = MathMin(lot, capLot);
    if(lot < minv - 1e-12)
@@ -2073,20 +2619,22 @@ void DrawPanel()
    ENUM_RISK_MODE rm = EffectiveRiskMode();
    string riskTxt = rm == RISK_FIXED ? "лот " + DoubleToString(InpFixedLot, 2)
                     : StringFormat("%.2f%% на сделку", TradeRiskPct(rm));
-   if(InpDailyRiskPct > 0)
-      riskTxt += StringFormat(" · в день %.1f%%, осталось %.2f %s", InpDailyRiskPct, MathMax(0.0, DailyRiskLeft()),
+   if(g_set.cRisk) riskTxt += " (TG)";
+   if(g_set.dailyRiskPct > 0)
+      riskTxt += StringFormat(" · в день %.1f%%%s, осталось %.2f %s", g_set.dailyRiskPct, g_set.cDaily ? " (TG)" : "", MathMax(0.0, DailyRiskLeft()),
                               AccountInfoString(ACCOUNT_CURRENCY));
-   string tpTxt = InpTPMode == TP_RR ? StringFormat("тейк RR 1:%.1f", InpRR)
+   string tpTxt = InpTPMode == TP_RR ? StringFormat("тейк RR 1:%.1f", g_set.rr)
                   : StringFormat("тейк %.0f–%.0f (LAL, RR от %.1f)", InpTPMin, InpTPMax, InpMinRR);
-   string mode = Relaxed() ? (InpWeakSignals ? " · слабые сигналы вкл." : " · добор") : "";
-   Comment("Mr. Casino v3.2 (золото)\n",
+   string mode = Relaxed() ? (g_set.weak ? " · слабые сигналы вкл." : " · добор") : "";
+   if(g_set.cWeak) mode += " (TG)";
+   Comment("Mr. Casino v3.3 (золото)\n", BridgeLine(),
            "Bias: D1=", BiasName(g_d1), "  H4=", BiasName(g_h4), "\n",
            "Сессия: ", InSession() ? "открыта" : "закрыта", " (Бишкек ", LocalHM(), ")", mode, "\n",
            "SELL-зона: ", NearestZoneText(-1), "\n",
            "BUY-зона: ", NearestZoneText(1), "\n",
            "Риск: ", EnumToString(rm), ", ", riskTxt, "\n",
            StringFormat("Стоп %.0f–%.0f · %s\n", InpMinSL, InpMaxSL, tpTxt),
-           "Сделок сегодня: ", g_day.trades, " / ", InpMaxTradesDay, "  (COUNTER ", g_day.counter, ")\n",
+           "Сделок сегодня: ", g_day.trades, " / ", g_set.maxTrades, (g_set.cMax ? " (TG)" : ""), "  (COUNTER ", g_day.counter, ")\n",
            "За день: ", DoubleToString(g_day.pts, 1), " pt / ", DoubleToString(g_day.usd, 2), " ", AccountInfoString(ACCOUNT_CURRENCY), "\n",
            "Спред: ", DoubleToString(sp, 2), "\n",
            "Пропуск: ", g_lastSkip);
@@ -2097,28 +2645,34 @@ void DrawPanel()
 //+------------------------------------------------------------------+
 string GlobalBlock()
   {
+   if(g_set.paused) return "пауза (" + g_pauseReason + ")";
    if(HasPos()) return "позиция уже открыта";
    if(FridayCloseTime()) return "пятница, закрытие рынка";
    if(!InSession()) return "вне сессии (Бишкек " + LocalHM() + ")";
-   if(g_day.trades >= InpMaxTradesDay) return StringFormat("лимит сделок дня %d", InpMaxTradesDay);
+   if(g_day.trades >= g_set.maxTrades) return StringFormat("лимит сделок дня %d", g_set.maxTrades);
    if(InpDailyTarget > 0 && g_day.pts >= InpDailyTarget) return StringFormat("дневная цель %.1f pt", g_day.pts);
    if(InpMaxLossStreak > 0 && g_day.lossStreak >= InpMaxLossStreak)
       return StringFormat("%d стопа подряд, пауза до завтра", g_day.lossStreak);
-   if(InpDailyRiskPct > 0 && DailyRiskLeft() <= 0)
-      return StringFormat("дневной риск %.1f%% исчерпан (%.2f за день), пауза до завтра", InpDailyRiskPct, g_day.usd);
+   if(g_set.dailyRiskPct > 0 && DailyRiskLeft() <= 0)
+      return StringFormat("дневной риск %.1f%% исчерпан (%.2f за день), пауза до завтра", g_set.dailyRiskPct, g_day.usd);
    if(NewsBlock()) return "окно новостей";
    double spread = SymbolInfoDouble(g_sym, SYMBOL_ASK) - SymbolInfoDouble(g_sym, SYMBOL_BID);
    if(spread > InpMaxSpread) return StringFormat("спред %.2f > %.2f", spread, InpMaxSpread);
    return "";
   }
 
-void Skip(int zi, string why)
+// hadSignal: триггер был, но фильтр не пустил (signal_skipped); иначе нет триггера (analysis_skip, уровень 2)
+void Skip(int zi, string why, bool hadSignal = false)
   {
    g_lastSkip = why;
    if(g_zones[zi].lastSkip == why && TimeCurrent() - g_zones[zi].lastSkipT < 1800) return;
    g_zones[zi].lastSkip = why;
    g_zones[zi].lastSkipT = TimeCurrent();
    Lg(1, "Пропуск " + ZoneTag(g_zones[zi]) + ": " + why);
+   bool sig = hadSignal || g_sigThisPass;
+   Emit(sig ? "signal_skipped" : "analysis_skip", sig ? 1 : 2, "info",
+        JS("dir", DirName(g_zones[zi].dir)) + "," + JN("lo", g_zones[zi].lo, g_digits) + "," + JN("hi", g_zones[zi].hi, g_digits) + "," +
+        JS("why", why), (sig ? "⏭ Пропуск " : "· Нет триггера ") + ZoneTag(g_zones[zi]) + ": " + why, -1);
   }
 
 // Книга: Doji или волчок (spinning top) — нерешительность, вход через свечу. По стратегии свеча,
@@ -2175,9 +2729,10 @@ void TryEntry()
      {
       if(g_zones[i].status != ZONE_CONFIRMED || !g_zones[i].tradable) continue;
       int d = g_zones[i].dir;
+      g_sigThisPass = false;
       if(!InRegion(g_zones[i], r)) continue;
       if(gblock != "") { Skip(i, gblock); continue; }
-      if((d > 0 && !InpTradeBuy) || (d < 0 && !InpTradeSell)) { Skip(i, "сторона выключена"); continue; }
+      if((d > 0 && !g_set.tradeBuy) || (d < 0 && !g_set.tradeSell)) { Skip(i, "сторона выключена"); continue; }
       int tp = TradeType(d);
       if(tp == T_COUNTER)
         {
@@ -2190,6 +2745,7 @@ void TryEntry()
       SSig s;
       string why = "";
       if(!EvalZone(g_zones[i], r, s, why)) { Skip(i, why); continue; }
+      g_sigThisPass = true;
       int need = MinScore(tp);
       if(g_zones[i].score < need)
         { Skip(i, StringFormat("балл %d < %d (%s, триггер %s)", g_zones[i].score, need, TypeName(tp), s.trig)); continue; }
@@ -2207,7 +2763,8 @@ void TryEntry()
       int pts = g_zones[i].score + s.pts;
       if(pts > bpts) { bpts = pts; bi = i; bs = s; btype = tp; }
      }
-   if(bi < 0) return;
+   if(bi < 0) { g_sigThisPass = false; return; }
+   g_sigThisPass = true;
 
    int d = g_zones[bi].dir;
    SZone z = g_zones[bi];
@@ -2239,8 +2796,8 @@ void TryEntry()
    double tpDist;
    if(InpTPMode == TP_RR)                                // v3.2: тейк = стоп × RR (1:2)
      {
-      tpDist = InpRR * dist;
-      tpSrc = StringFormat("RR 1:%.1f", InpRR);
+      tpDist = g_set.rr * dist;
+      tpSrc = StringFormat("RR 1:%.1f", g_set.rr);
       if(tpDist < MinStopDist()) { Skip(bi, StringFormat("тейк %.1f меньше стоп-уровня брокера", tpDist)); return; }
      }
    else
@@ -2268,9 +2825,11 @@ void TryEntry()
    uint rc = g_trade.ResultRetcode();
    if(!ok || (rc != TRADE_RETCODE_DONE && rc != TRADE_RETCODE_PLACED))
      {
+      RegisterReject(rc, g_trade.ResultRetcodeDescription(), bs.trig);
       Skip(bi, StringFormat("ордер отклонён: %u %s", rc, g_trade.ResultRetcodeDescription()));
       return;
      }
+   g_rejectStreak = 0;
 
    ulong tk; long id; int pd; double pv, po, psl, ptp;
    if(!FindPos(tk, id, pd, pv, po, psl, ptp)) { po = entry; id = 0; psl = sl; ptp = tp; pv = lot; }
@@ -2281,6 +2840,8 @@ void TryEntry()
    g_pEntry = po; g_pSL = psl; g_pTP = ptp; g_pLot = pv; g_pLal = major; g_pRisk = riskUsd;
    g_pZoneW = z.hi - z.lo; g_pZLo = z.lo; g_pZHi = z.hi;
    g_pBEAt = BEAt(MathAbs(ptp - po));
+   g_pOpenT = TimeCurrent(); g_pMark = bs.mark; g_pManual = false; g_pWeak = weak;
+   g_pStrN = bpts >= 7 ? 3 : (bpts >= 5 ? 2 : 1);
    g_beDone = false; g_partDone = false; g_exitTag = ""; g_closeRetry = 0;
    SetStatus(g_zones[bi], ZONE_USED, "сделка");
    if(btype == T_COUNTER) g_cntToday++;
@@ -2300,14 +2861,21 @@ void TryEntry()
    DrawZones();
    DrawPanel();
 
-   Notify(StringFormat("%s %s · %s\nEntry: %s\nSL: %s\nTP: %s (%s)\nRR: 1:%.1f\nРиск: %.2f %s (%.2f%%) · лот %.2f\n\n✅ Зона %s–%s · балл %d\n✅ %s\n✅ Триггер %s (%s), FU класс %s\n%sТФ: M5 · сессия %s\nSignal Strength: %s%s",
+   string ef = JS("symbol", g_sym) + "," + JS("side", DirName(d)) + "," + JI("ticket", g_pId) + "," + JN("entry", po, g_digits) + "," +
+               JN("sl", psl, g_digits) + "," + JN("tp", ptp, g_digits) + "," + JN("lot", pv, 2) + "," + JN("risk_usd", riskUsd, 2) + "," +
+               JN("risk_pct", riskPct, 2) + "," + JS("trigger", bs.trig) + "," + JS("mark", bs.mark) + "," + JS("fu_class", ClsName(bs.cls)) + "," +
+               JS("type", tname) + "," + JB("manual", false) + "," + JB("weak", weak) + "," + JI("strength", g_pStrN) + "," +
+               JN("zone_lo", z.lo, g_digits) + "," + JN("zone_hi", z.hi, g_digits) + "," + JI("score", z.score) + "," + JS("srcs", z.srcs) + "," +
+               JB("htf", z.htf) + "," + JS("session", g_pSess) + "," + JN("rr", MathAbs(ptp - po) / MathMax(MathAbs(po - psl), 0.01), 2) + "," +
+               JS("tp_src", tpSrc) + "," + JS("sl_src", slSrc) + "," + JN("sl_pts", dist, 1) + "," + JN("tp_pts", tpDist, 1);
+   Emit("trade_opened", 0, "info", ef, StringFormat("%s %s · %s\nEntry: %s\nSL: %s\nTP: %s (%s)\nRR: 1:%.1f\nРиск: %.2f %s (%.2f%%) · лот %.2f\n\n✅ Зона %s–%s · балл %d\n✅ %s\n✅ Триггер %s (%s), FU класс %s\n%sТФ: M5 · сессия %s\nSignal Strength: %s%s",
                        g_sym, DirName(d), tname,
                        Px(po), Px(psl), Px(ptp), tpSrc,
                        MathAbs(ptp - po) / MathMax(MathAbs(po - psl), 0.01),
                        riskUsd, cur, riskPct, pv,
                        Px(z.lo), Px(z.hi), z.score, z.srcs, bs.trig, bs.mark, ClsName(bs.cls),
                        z.htf ? "✅ HTF Re-test Level\n" : "", g_pSess, Stars(total),
-                       weak ? "\n⚠️ Слабый сигнал" : ""));
+                       weak ? "\n⚠️ Слабый сигнал" : ""), (int)PERIOD_M5);
   }
 
 //+------------------------------------------------------------------+
@@ -2367,23 +2935,46 @@ void OnPositionClosed()
                               g_pTrig, ClsName(g_pCls), g_pScore, srcs, g_pZoneW, g_pSess,
                               Px(g_pEntry), Px(g_pSL), Px(g_pTP), g_pLot, pts, pnl, ex, g_pStrength, g_pRisk);
    LogTrade(line);
+   // v3.3: trades.csv моста (колонки раздела 13 ТЗ), время Бишкека, запятые в тексте заменены пробелом
+   if(g_bridgeOn)
+     {
+      datetime tOpen = g_pOpenT > 0 ? g_pOpenT : tOut;
+      double rrReal = g_pRisk > 0 ? pnl / g_pRisk : 0.0;
+      string zs = g_pSrcs;
+      StringReplace(zs, ",", " ");
+      string mk = g_pMark;
+      StringReplace(mk, ",", " ");
+      string row = LocalStamp(ToLocal(tOpen)) + "," + LocalStamp(ToLocal(tOut)) + "," + IntegerToString(g_pId) + "," + DirName(dir) + "," +
+                   g_pType + "," + g_pTrig + "," + mk + "," + ClsName(g_pCls) + "," + IntegerToString(g_pScore) + "," + zs + "," +
+                   DoubleToString(g_pZoneW, 1) + "," + g_pSess + "," + Px(g_pEntry) + "," + Px(g_pSL) + "," + Px(g_pTP) + "," +
+                   DoubleToString(g_pLot, 2) + "," + DoubleToString(g_pRisk, 2) + "," + DoubleToString(pts, 2) + "," +
+                   DoubleToString(pnl, 2) + "," + DoubleToString(rrReal, 2) + "," + ex + "," + IntegerToString(g_pStrN) + "," +
+                   (g_pWeak ? "true" : "false") + "," + (g_pManual ? "true" : "false") + "," + IntegerToString((long)((tOut - tOpen) / 60));
+      AppendUtf8(g_dir + "\\trades.csv", row, TRADES_HEADER);
+     }
    if(ex == "SL")                      // после стопа повторного входа в зону нет
       for(int zi = 0; zi < ArraySize(g_zones); zi++)
          if(g_zones[zi].dir == dir && MathAbs(g_zones[zi].lo - g_pZLo) < 0.01 && MathAbs(g_zones[zi].hi - g_pZHi) < 0.01)
             SetStatus(g_zones[zi], ZONE_INVALID, "стоп по зоне");
    Lg(0, StringFormat("ЗАКРЫТА %s %s | %s | %+.1f pt / %+.2f $ | вход %s выход %s", DirName(dir), g_pType, ex,
                       pts, pnl, Px(inP), Px(outP)));
-   Notify(StringFormat("%s %s · %s закрыта (%s)\nВход: %s → Выход: %s\nРезультат: %+.1f pt / %+.2f $",
-                       g_sym, DirName(dir), g_pType, ex, Px(inP), Px(outP), pts, pnl));
-   g_pId = 0; g_exitTag = ""; g_closeRetry = 0;
+   string cf = JS("symbol", g_sym) + "," + JI("ticket", g_pId) + "," + JS("side", DirName(dir)) + "," + JN("entry", inP, g_digits) + "," +
+               JN("exit_price", outP, g_digits) + "," + JN("pts", pts, 1) + "," + JN("usd", pnl, 2) + "," + JS("exit", ex) + "," +
+               JI("duration_min", (long)((tOut - (g_pOpenT > 0 ? g_pOpenT : tOut)) / 60)) + "," + JS("trigger", g_pTrig) + "," +
+               JS("type", g_pType) + "," + JS("session", g_pSess) + "," + JB("manual", g_pManual);
+   Emit("trade_closed", 0, "info", cf, StringFormat("%s %s · %s закрыта (%s)\nВход: %s → Выход: %s\nРезультат: %+.1f pt / %+.2f $",
+                       g_sym, DirName(dir), g_pType, ex, Px(inP), Px(outP), pts, pnl), (int)PERIOD_M5);
+   g_pId = 0; g_exitTag = ""; g_closeRetry = 0; g_pManual = false; g_pOpenT = 0;
    ClearLines();
    g_day = CalcDay();
    // v3.2: дневная цель 0 = выкл (раньше уведомление приходило после каждой сделки в плюс)
-   if(g_day.trades >= InpMaxTradesDay || (InpDailyTarget > 0 && g_day.pts >= InpDailyTarget) ||
+   if(g_day.trades >= g_set.maxTrades || (InpDailyTarget > 0 && g_day.pts >= InpDailyTarget) ||
       (InpMaxLossStreak > 0 && g_day.lossStreak >= InpMaxLossStreak) ||
-      (InpDailyRiskPct > 0 && DailyRiskLeft() <= 0))
-      Notify(StringFormat("Дневной лимит достигнут: сделок %d, %+.1f pt / %+.2f %s, стопов подряд %d",
-                          g_day.trades, g_day.pts, g_day.usd, AccountInfoString(ACCOUNT_CURRENCY), g_day.lossStreak));
+      (g_set.dailyRiskPct > 0 && DailyRiskLeft() <= 0))
+      Emit("limit_reached", 0, "info", JI("trades", g_day.trades) + "," + JN("pts", g_day.pts, 1) + "," + JN("usd", g_day.usd, 2) + "," +
+           JI("loss_streak", g_day.lossStreak),
+           StringFormat("⛔ Дневной лимит достигнут: сделок %d, %+.1f pt / %+.2f %s, стопов подряд %d. Робот стоит до завтра.",
+                        g_day.trades, g_day.pts, g_day.usd, AccountInfoString(ACCOUNT_CURRENCY), g_day.lossStreak), -1);
    DrawZones();
    DrawPanel();
   }
@@ -2403,8 +2994,41 @@ void ManagePosition()
       g_pEntry = op; g_pSL = sl; g_pTP = tp; g_pLot = vol; g_pRisk = 0;
       g_pLal = 0; g_beDone = d * (sl - op) >= 0; g_partDone = false; g_exitTag = ""; g_closeRetry = 0;
       g_pBEAt = BEAt(tp > 0 ? MathAbs(tp - op) : 0);
+      g_pOpenT = (datetime)PositionGetInteger(POSITION_TIME);
+      g_pMark = "-"; g_pWeak = false; g_pStrN = 1;
+      g_pManual = StringFind(PositionGetString(POSITION_COMMENT), "MANUAL") >= 0;
+      if(g_pManual) { g_pTrig = "MANUAL"; g_pMark = "MANUAL"; }
      }
-   if(FridayCloseTime()) { ClosePosNow(tk, "FRIDAY"); return; }
+   if(FridayCloseTime())
+     {
+      AlertSet("friday_close", true, "info", "Позиция закрыта перед выходными (рынок закрывается).");
+      ClosePosNow(tk, "FRIDAY");
+      return;
+     }
+   // v3.3: позиция без стопа — тревога и повторная установка (до 3 попыток), затем автопауза [§5.5, §5.8]
+   if(sl <= 0)
+     {
+      AlertSet("no_sl", true, "critical", "Позиция робота без стопа. Робот пытается поставить стоп заново.");
+      if(TimeCurrent() - g_noSlLast >= 2 && g_noSlTries < 3)
+        {
+         g_noSlLast = TimeCurrent();
+         g_noSlTries++;
+         double curp = d > 0 ? SymbolInfoDouble(g_sym, SYMBOL_BID) : SymbolInfoDouble(g_sym, SYMBOL_ASK);
+         double want = g_pSL > 0 ? g_pSL : op - d * InpMaxSL;
+         if(!(d * (curp - want) >= MinStopDist())) want = curp - d * (MinStopDist() + InpMinSL);
+         want = NormalizeDouble(want, g_digits);
+         if(g_trade.PositionModify(tk, want, tp)) { g_pSL = want; g_noSlTries = 0; }
+         else if(g_noSlTries >= 3 && !g_set.paused)
+           {
+            g_set.paused = true;
+            g_pauseReason = "автопауза: позиция без стопа, поставить не удалось";
+            SaveSettings();
+            Emit("note", 0, "critical", "", "⛔ Не удалось поставить стоп за 3 попытки. Робот поставлен на паузу.", -1);
+           }
+        }
+      return;
+     }
+   if(AlertIsOn("no_sl")) { AlertSet("no_sl", false, "critical", "стоп выставлен"); g_noSlTries = 0; }
 
    double bid = SymbolInfoDouble(g_sym, SYMBOL_BID), ask = SymbolInfoDouble(g_sym, SYMBOL_ASK);
    double cur = d > 0 ? bid : ask;
@@ -2421,7 +3045,8 @@ void ManagePosition()
             g_beDone = true;
             g_pSL = nsl;
             DrawLine("SL", nsl, clrRed);
-            Notify(StringFormat("%s %s: стоп в безубытке\nSL: %s", g_sym, DirName(d), Px(nsl)));
+            Emit("trade_be", 0, "info", JI("ticket", g_pId) + "," + JN("sl", nsl, g_digits),
+                 StringFormat("⚪ %s %s: стоп в безубытке\nSL: %s", g_sym, DirName(d), Px(nsl)), -1);
            }
         }
      }
@@ -2434,7 +3059,12 @@ void ManagePosition()
       double cv = MathFloor(vol / 2.0 / step + 1e-9) * step;
       if(cv >= minv && vol - cv >= minv - 1e-12)
         {
-         if(g_trade.PositionClosePartial(tk, NormalizeDouble(cv, 2))) g_partDone = true;
+         if(g_trade.PositionClosePartial(tk, NormalizeDouble(cv, 2)))
+           {
+            g_partDone = true;
+            Emit("trade_partial", 0, "info", JI("ticket", g_pId) + "," + JN("closed_lot", cv, 2) + "," + JN("left_lot", vol - cv, 2),
+                 StringFormat("50%% позиции закрыто на первой LAL: %.2f лота, осталось %.2f", cv, vol - cv), -1);
+           }
         }
       else
          g_partDone = true;
@@ -2450,6 +3080,602 @@ void CheckEarlyExit()
    MqlRates m[];
    if(Load(PERIOD_M15, 10, m) < 6) return;
    if(Negation(m, 1, -d) > 0) ClosePosNow(tk, "EARLY");
+  }
+
+//+------------------------------------------------------------------+
+//| Мост v3.3: статус, тревоги, команды, отчёты, таймер [§5, §6, §8] |
+//+------------------------------------------------------------------+
+string PosBrief()
+  {
+   ulong tk; long id; int d; double vol, op, sl, tp;
+   if(!FindPos(tk, id, d, vol, op, sl, tp)) return "";
+   return StringFormat("Открыта %s %.2f с %s, сейчас %+.2f %s.", DirName(d), vol, Px(op), PositionGetDouble(POSITION_PROFIT),
+                       AccountInfoString(ACCOUNT_CURRENCY));
+  }
+
+string BlockText()
+  {
+   string b = GlobalBlock();
+   if(b == "позиция уже открыта") b = "";
+   return b;
+  }
+
+string ZonesJson()
+  {
+   string s = "";
+   int cnt = 0;
+   for(int i = 0; i < ArraySize(g_zones); i++)
+     {
+      if(!g_zones[i].tradable || g_zones[i].status > ZONE_CONFIRMED) continue;
+      if(cnt > 0) s += ",";
+      s += "{" + JS("dir", DirName(g_zones[i].dir)) + "," + JN("lo", g_zones[i].lo, g_digits) + "," +
+           JN("hi", g_zones[i].hi, g_digits) + "," + JS("status", StatusName(g_zones[i].status)) + "," +
+           JI("score", g_zones[i].score) + "," + JS("srcs", g_zones[i].srcs) + "," + JB("htf", g_zones[i].htf) + "," +
+           JN("dist", ZoneDist(g_zones[i]), 2) + "}";
+      cnt++;
+     }
+   return s;
+  }
+
+string NewsJson()
+  {
+   string s = "";
+   int cnt = 0;
+   datetime nowLoc = LocalNow();
+   for(int i = 0; i < ArraySize(g_news); i++)
+     {
+      datetime loc = ToLocal(g_news[i]);
+      if(loc + InpNewsMinutes * 60 < nowLoc) continue;                 // уже прошла
+      string st = LocalStamp(loc);
+      st = StringSubstr(st, 0, 16);
+      s += (cnt > 0 ? "," : "") + "\"" + st + " (окно ±" + IntegerToString(InpNewsMinutes) + " мин)\"";
+      cnt++;
+     }
+   return s;
+  }
+
+string PositionJson()
+  {
+   ulong tk; long id; int d; double vol, op, sl, tp;
+   if(!FindPos(tk, id, d, vol, op, sl, tp)) return "null";
+   datetime ot = (datetime)PositionGetInteger(POSITION_TIME);
+   return "{" + JI("ticket", id) + "," + JS("side", DirName(d)) + "," + JN("lot", vol, 2) + "," + JN("entry", op, g_digits) + "," +
+          JN("sl", sl, g_digits) + "," + JN("tp", tp, g_digits) + "," + JN("profit", PositionGetDouble(POSITION_PROFIT), 2) + "," +
+          JS("trigger", g_pTrig) + "," + JN("risk", g_pRisk, 2) + "," + JB("be", g_beDone) + "," +
+          JS("opened_utc", IsoUtc(ot - GmtOffset())) + "," + JB("manual", g_pManual) + "}";
+  }
+
+void WriteStatus()
+  {
+   if(!g_bridgeOn) return;
+   double bid = SymbolInfoDouble(g_sym, SYMBOL_BID), ask = SymbolInfoDouble(g_sym, SYMBOL_ASK);
+   long mode = AccountInfoInteger(ACCOUNT_TRADE_MODE);
+   string modeS = mode == ACCOUNT_TRADE_MODE_REAL ? "real" : (mode == ACCOUNT_TRADE_MODE_CONTEST ? "contest" : "demo");
+   datetime lastTick = (datetime)SymbolInfoInteger(g_sym, SYMBOL_TIME);
+   double left = g_set.dailyRiskPct > 0 ? DailyRiskLeft() : 0.0;
+   long pingUs = (long)TerminalInfoInteger(TERMINAL_PING_LAST);
+   ENUM_RISK_MODE rm = EffectiveRiskMode();
+   string s = "{" + JI("schema", 1) + "," + JS("robot", g_robotId) + "," + JS("version", "3.30") + "," +
+              JS("ts_utc", IsoUtc(TimeGMT())) + "," + JS("ts_local", LocalStamp(LocalNow())) + ",";
+   s += "\"terminal\":{" + JB("connected", (bool)TerminalInfoInteger(TERMINAL_CONNECTED)) + "," +
+        JB("algo_allowed", (bool)TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) + "," +
+        JB("ea_trade_allowed", (bool)MQLInfoInteger(MQL_TRADE_ALLOWED)) + "," + JI("ping_ms", pingUs > 0 ? pingUs / 1000 : -1) + "},";
+   s += "\"account\":{" + JI("login", AccountInfoInteger(ACCOUNT_LOGIN)) + "," + JS("server", AccountInfoString(ACCOUNT_SERVER)) + "," +
+        JS("currency", AccountInfoString(ACCOUNT_CURRENCY)) + "," + JS("mode", modeS) + "," +
+        JN("balance", AccountInfoDouble(ACCOUNT_BALANCE), 2) + "," + JN("equity", AccountInfoDouble(ACCOUNT_EQUITY), 2) + "," +
+        JN("margin_free", AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2) + "," +
+        JN("margin_level", AccountInfoDouble(ACCOUNT_MARGIN_LEVEL), 1) + "},";
+   s += "\"symbol\":{" + JS("name", g_sym) + "," + JN("bid", bid, g_digits) + "," + JN("ask", ask, g_digits) + "," +
+        JN("spread", ask - bid, 2) + "," + JS("last_tick_utc", IsoUtc(lastTick - GmtOffset())) + "," +
+        JB("market_open", SymbolSessionOpen()) + "},";
+   s += "\"session\":{" + JB("open", InSession()) + "," + JS("name", SessionName()) + "," + JB("relaxed", Relaxed()) + "},";
+   s += JB("paused", g_set.paused) + "," + JS("pause_reason", g_set.paused ? g_pauseReason : "") + ",";
+   s += "\"bias\":{" + JS("d1", BiasName(g_d1)) + "," + JS("h4", BiasName(g_h4)) + "},";
+   s += "\"zones\":[" + ZonesJson() + "],";
+   s += "\"day\":{" + JI("trades", g_day.trades) + "," + JI("max_trades", g_set.maxTrades) + "," + JI("counter", g_day.counter) + "," +
+        JN("pts", g_day.pts, 1) + "," + JN("usd", g_day.usd, 2) + "," + JI("loss_streak", g_day.lossStreak) + "," +
+        JN("risk_left", left, 2) + "," + JS("blocked", BlockText()) + "},";
+   s += "\"position\":" + PositionJson() + ",";
+   s += "\"settings\":{" + JN("risk_pct", TradeRiskPct(rm), 2) + "," + JN("daily_risk_pct", g_set.dailyRiskPct, 2) + "," +
+        JI("max_trades", g_set.maxTrades) + "," + JN("rr", g_set.rr, 2) + "," + JB("weak", g_set.weak) + "," +
+        JB("buy", g_set.tradeBuy) + "," + JB("sell", g_set.tradeSell) + "},";
+   s += "\"bridge\":{" + JB("bot_alive", g_botAlive) + "," + JS("bot_heartbeat_utc", g_botHb > 0 ? IsoUtc(g_botHb) : "") + "},";
+   s += "\"news\":[" + NewsJson() + "],";
+   s += JS("last_skip", g_lastSkip) + "}";
+   WriteAtomic(g_dir + "\\status.json", s);
+  }
+
+//--- heartbeat бота и запасной канал [§5.2, §5.3]
+void ReadHeartbeat()
+  {
+   string t;
+   bool alive = false;
+   if(ReadUtf8(g_dir + "\\bot_heartbeat.json", t) && t != "")
+     {
+      string k[], v[];
+      JParse(t, k, v);
+      datetime hb = IsoToTime(JGet(k, v, "ts_utc"));
+      if(hb > 0)
+        {
+         g_botHb = hb;
+         alive = (TimeGMT() - hb) <= 30;
+        }
+     }
+   g_botAlive = alive;
+   datetime ref = g_botHb > 0 ? g_botHb : g_startUtc;
+   bool silent = (TimeGMT() - ref) > 180;
+   if(InpTgFallback && silent && !g_fallback)
+     {
+      g_fallback = true;
+      QueueTG("⚠️ Бот не отвечает, пишу напрямую. Критичные события и сделки идут сюда.");
+     }
+   else if(!silent && g_fallback)
+      g_fallback = false;
+  }
+
+//--- тревоги, которые видит робот [§5.8]; вызывается раз в 5 секунд
+void CheckAlerts()
+  {
+   datetime now = TimeGMT();
+   string cur = AccountInfoString(ACCOUNT_CURRENCY);
+   // disconnect: нет связи с брокером дольше 60 с
+   bool conn = (bool)TerminalInfoInteger(TERMINAL_CONNECTED);
+   if(!conn) { if(g_discSince == 0) g_discSince = now; }
+   else g_discSince = 0;
+   bool disc = !conn && g_discSince > 0 && (now - g_discSince) >= 60 && (SymbolSessionOpen() || HasPos());
+   AlertSet("disconnect", disc, "critical",
+            disc ? StringFormat("Нет связи с брокером с %s (%d мин). %s Стоп стоит у брокера. Проверь интернет на ПК и MT5.",
+                                StringSubstr(LocalStamp(g_discSince + InpUtcOffset * 3600), 11, 5), (int)((now - g_discSince) / 60), PosBrief())
+                 : "связь с брокером есть");
+   // algo_off: алго-торговля выключена
+   bool algo = (bool)TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) && (bool)MQLInfoInteger(MQL_TRADE_ALLOWED);
+   AlertSet("algo_off", !algo, "critical",
+            !algo ? "Алго-торговля выключена: робот не может открывать и закрывать сделки. Включи кнопку «Алго-торговля» в MT5."
+                  : "алго-торговля включена");
+   // day_dd: эквити ниже баланса начала дня на InpAlertDDPct
+   double base = DayStartBalance();
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   bool dd = InpAlertDDPct > 0 && base > 0 && eq < base * (1.0 - InpAlertDDPct / 100.0);
+   AlertSet("day_dd", dd, "warning",
+            dd ? StringFormat("Эквити %.2f %s ниже баланса начала дня %.2f на %.1f%%.", eq, cur, base, (base - eq) / base * 100.0)
+               : "просадка за день ниже порога");
+   // day_limit: дневной риск исчерпан, робот стоит до завтра
+   bool lim = g_set.dailyRiskPct > 0 && DailyRiskLeft() <= 0;
+   AlertSet("day_limit", lim, "critical",
+            lim ? StringFormat("Дневной риск %.1f%% исчерпан (%.2f %s за день). Робот стоит до завтра.", g_set.dailyRiskPct, g_day.usd, cur)
+                : "новый день: дневной лимит снова доступен");
+   // spread: спред выше нормы дольше 2 минут при открытой позиции
+   double sp = SymbolInfoDouble(g_sym, SYMBOL_ASK) - SymbolInfoDouble(g_sym, SYMBOL_BID);
+   bool wide = HasPos() && InpAlertSpreadX > 0 && sp > InpAlertSpreadX * InpMaxSpread;
+   if(wide) { if(g_spreadSince == 0) g_spreadSince = now; }
+   else g_spreadSince = 0;
+   bool spAlert = wide && g_spreadSince > 0 && (now - g_spreadSince) >= 120;
+   AlertSet("spread", spAlert, "warning",
+            spAlert ? StringFormat("Спред %.2f выше нормы %.2f больше 2 минут при открытой позиции.", sp, InpMaxSpread * InpAlertSpreadX)
+                    : "спред в норме");
+   // no_ticks: нет тиков 5 минут, а сессия символа открыта
+   bool noTicks = SymbolSessionOpen() && (GetTickCount64() - g_lastTickMs) >= 300000;
+   AlertSet("no_ticks", noTicks, "warning", noTicks ? "Нет тиков больше 5 минут при открытой торговой сессии." : "тики идут");
+   // margin: уровень маржи ниже 200%
+   double ml = AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
+   bool mg = AccountInfoDouble(ACCOUNT_MARGIN) > 0 && ml < 200.0;
+   AlertSet("margin", mg, "warning", mg ? StringFormat("Уровень маржи %.0f%% ниже 200%%.", ml) : "уровень маржи в норме");
+   // friday_close: закрываем событие после пятничного окна
+   if(AlertIsOn("friday_close") && !FridayCloseTime())
+      AlertSet("friday_close", false, "info", "рынок открыт, торговля возобновлена");
+  }
+
+//--- зона: цена впервые зашла в торгуемую CONFIRMED-зону [§5.6]
+void CheckZoneTouch()
+  {
+   double bid = SymbolInfoDouble(g_sym, SYMBOL_BID);
+   for(int i = 0; i < ArraySize(g_zones); i++)
+     {
+      if(g_zones[i].touched || !g_zones[i].tradable || g_zones[i].status != ZONE_CONFIRMED) continue;
+      if(bid < g_zones[i].lo || bid > g_zones[i].hi) continue;
+      g_zones[i].touched = true;
+      Emit("zone_touch", 1, "info", JS("dir", DirName(g_zones[i].dir)) + "," + JN("lo", g_zones[i].lo, g_digits) + "," +
+           JN("hi", g_zones[i].hi, g_digits) + "," + JI("score", g_zones[i].score),
+           StringFormat("👀 Цена в %s-зоне %s–%s (балл %d), жду триггер", DirName(g_zones[i].dir), Px(g_zones[i].lo),
+                        Px(g_zones[i].hi), g_zones[i].score), -1);
+     }
+  }
+
+//--- утренний брифинг и дневной отчёт [§5.2]
+void SendMorning()
+  {
+   datetime loc = LocalNow();
+   string txt = StringFormat("☀️ План на %s · %s\nBias: D1 %s · H4 %s\nSELL-зона: %s\nBUY-зона: %s\nРиск %.2f%% на сделку, %.1f%% в день · до %d сделок · RR 1:%.1f",
+                             StringSubstr(LocalStamp(loc), 8, 2) + "." + StringSubstr(LocalStamp(loc), 5, 2), g_sym, BiasName(g_d1), BiasName(g_h4),
+                             NearestZoneText(-1), NearestZoneText(1), TradeRiskPct(EffectiveRiskMode()), g_set.dailyRiskPct,
+                             g_set.maxTrades, g_set.rr);
+   Emit("morning_brief", 0, "info", JS("bias_d1", BiasName(g_d1)) + "," + JS("bias_h4", BiasName(g_h4)), txt, (int)PERIOD_M5);
+  }
+
+void SendDailyReport()
+  {
+   g_day = CalcDay();
+   datetime loc = LocalNow();
+   string cur = AccountInfoString(ACCOUNT_CURRENCY);
+   string txt = StringFormat("📊 Итог дня %s · %s\nСделок %d/%d · %+.1f pt · %+.2f %s\nБаланс: %.2f %s",
+                             StringSubstr(LocalStamp(loc), 8, 2) + "." + StringSubstr(LocalStamp(loc), 5, 2), g_sym, g_day.trades,
+                             g_set.maxTrades, g_day.pts, g_day.usd, cur, AccountInfoDouble(ACCOUNT_BALANCE), cur);
+   Emit("daily_report", 0, "info", JI("trades", g_day.trades) + "," + JN("pts", g_day.pts, 1) + "," + JN("usd", g_day.usd, 2),
+        txt, (int)PERIOD_M5);
+  }
+
+void CheckScheduled()
+  {
+   datetime loc = LocalNow();
+   MqlDateTime t;
+   TimeToStruct(loc, t);
+   bool weekday = t.day_of_week >= 1 && t.day_of_week <= 5;
+   if(!weekday) return;                                   // в субботу и воскресенье брифинг и отчёт не шлём
+   string day = StringFormat("%04d.%02d.%02d", t.year, t.mon, t.day);
+   int mins = t.hour * 60 + t.min;
+   if(InpMorningHM != "" && day != g_lastMorningDay)
+     {
+      int at = ParseHM(InpMorningHM);
+      if(mins >= at && mins < at + 60) { g_lastMorningDay = day; SaveSettings(); SendMorning(); }
+     }
+   if(InpReportHM != "" && day != g_lastReportDay)
+     {
+      int at = ParseHM(InpReportHM);
+      if(mins >= at && mins < at + 60) { g_lastReportDay = day; SaveSettings(); SendDailyReport(); }
+     }
+  }
+
+//--- команды [§8]
+bool ParseNum(const string &k[], const string &v[], string key, double &out)
+  {
+   if(!JHas(k, key)) return false;
+   out = StringToDouble(JGet(k, v, key));
+   return true;
+  }
+
+bool ExecSet(const string &k[], const string &v[], string &msg)
+  {
+   string allowed[7] = {"risk_pct", "daily_risk_pct", "max_trades", "rr", "weak", "buy", "sell"};
+   bool any = false;
+   for(int i = 0; i < ArraySize(k); i++)
+     {
+      if(StringFind(k[i], "args.") != 0) continue;
+      string name = StringSubstr(k[i], 5);
+      bool known = false;
+      for(int q = 0; q < 7; q++)
+         if(allowed[q] == name) known = true;
+      if(!known) { msg = "неизвестная настройка: " + name; return false; }
+      any = true;
+     }
+   if(!any) { msg = "не указана настройка"; return false; }
+   double risk = 0, daily = 0, rr = 0, mx = 0;
+   bool hRisk = ParseNum(k, v, "args.risk_pct", risk), hDaily = ParseNum(k, v, "args.daily_risk_pct", daily);
+   bool hRr = ParseNum(k, v, "args.rr", rr), hMax = ParseNum(k, v, "args.max_trades", mx);
+   if(hRisk && (risk < 0.1 || risk > 5.0)) { msg = "риск на сделку: допустимо от 0.1 до 5"; return false; }
+   if(hDaily && (daily < 1.0 || daily > 20.0)) { msg = "дневной риск: допустимо от 1 до 20"; return false; }
+   if(hMax && (mx < 1 || mx > 10 || MathAbs(mx - MathRound(mx)) > 1e-9)) { msg = "максимум сделок: целое от 1 до 10"; return false; }
+   if(hRr && (rr < 1.0 || rr > 5.0)) { msg = "RR: допустимо от 1 до 5"; return false; }
+   bool hWeak = JHas(k, "args.weak"), hBuy = JHas(k, "args.buy"), hSell = JHas(k, "args.sell");
+   string sw = JGet(k, v, "args.weak"), sb = JGet(k, v, "args.buy"), ss = JGet(k, v, "args.sell");
+   if(hWeak && sw != "true" && sw != "false") { msg = "слабые сигналы: нужно да или нет"; return false; }
+   if(hBuy && sb != "true" && sb != "false") { msg = "BUY: нужно да или нет"; return false; }
+   if(hSell && ss != "true" && ss != "false") { msg = "SELL: нужно да или нет"; return false; }
+   bool nb = hBuy ? (sb == "true") : g_set.tradeBuy, ns = hSell ? (ss == "true") : g_set.tradeSell;
+   if(!nb && !ns) { msg = "нельзя выключить обе стороны"; return false; }
+   string parts = "";
+   if(hRisk) { g_set.riskPct = risk; g_set.cRisk = true; parts += (parts == "" ? "" : ", ") + StringFormat("риск %g%% на сделку", risk); }
+   if(hDaily) { g_set.dailyRiskPct = daily; g_set.cDaily = true; parts += (parts == "" ? "" : ", ") + StringFormat("дневной риск %g%%", daily); }
+   if(hMax) { g_set.maxTrades = (int)MathRound(mx); g_set.cMax = true; parts += (parts == "" ? "" : ", ") + StringFormat("максимум %d сделок в день", g_set.maxTrades); }
+   if(hRr) { g_set.rr = rr; g_set.cRr = true; parts += (parts == "" ? "" : ", ") + StringFormat("RR 1:%g", rr); }
+   if(hWeak) { g_set.weak = (sw == "true"); g_set.cWeak = true; parts += (parts == "" ? "" : ", ") + "слабые сигналы " + (g_set.weak ? "вкл" : "выкл"); }
+   if(hBuy || hSell)
+     {
+      g_set.tradeBuy = nb;
+      g_set.tradeSell = ns;
+      g_set.cSide = true;
+      parts += (parts == "" ? "" : ", ") + "стороны: " + (nb && ns ? "BUY и SELL" : (nb ? "только BUY" : "только SELL"));
+     }
+   SaveSettings();
+   msg = parts;
+   return true;
+  }
+
+bool ExecOpen(const string &k[], const string &v[], string &msg)
+  {
+   string side = JGet(k, v, "args.side");
+   double slPts = 0, riskArg = 0, rrArg = 0;
+   bool hSl = ParseNum(k, v, "args.sl_pts", slPts);
+   bool hRisk = ParseNum(k, v, "args.risk_pct", riskArg), hRr = ParseNum(k, v, "args.rr", rrArg);
+   if(side != "BUY" && side != "SELL") { msg = "side: BUY или SELL"; return false; }
+   if(!hSl || slPts <= 0 || slPts > 50.0) { msg = "стоп обязателен: от 0 до 50 пунктов"; return false; }
+   if(hRisk && (riskArg < 0.1 || riskArg > 5.0)) { msg = "риск на сделку: допустимо от 0.1 до 5"; return false; }
+   if(hRr && (rrArg < 1.0 || rrArg > 5.0)) { msg = "RR: допустимо от 1 до 5"; return false; }
+   if(HasPos()) { msg = "позиция уже открыта"; return false; }
+   if(FridayCloseTime()) { msg = "пятница, закрытие рынка"; return false; }
+   if(g_day.trades >= g_set.maxTrades) { msg = StringFormat("лимит сделок дня %d исчерпан", g_set.maxTrades); return false; }
+   if(g_set.dailyRiskPct > 0 && DailyRiskLeft() <= 0) { msg = "дневной риск исчерпан"; return false; }
+   double ask = SymbolInfoDouble(g_sym, SYMBOL_ASK), bid = SymbolInfoDouble(g_sym, SYMBOL_BID);
+   if(ask - bid > InpMaxSpread) { msg = StringFormat("спред %.2f > %.2f", ask - bid, InpMaxSpread); return false; }
+   int d = side == "BUY" ? 1 : -1;
+   double dist = slPts;
+   if(dist < MinStopDist()) { msg = StringFormat("стоп %.1f меньше стоп-уровня брокера", dist); return false; }
+   double rr = hRr ? rrArg : g_set.rr;
+   double entry = d > 0 ? ask : bid;
+   double sl = NormalizeDouble(entry - d * dist, g_digits);
+   double tp = NormalizeDouble(entry + d * rr * dist, g_digits);
+   double riskUsd = 0;
+   string why = "";
+   double lot = CalcLot(dist, d, entry, riskUsd, why, hRisk ? riskArg : -1.0);
+   if(lot <= 0) { msg = why; return false; }
+   bool ok = d > 0 ? g_trade.Buy(lot, g_sym, 0.0, sl, tp, "MC MANUAL") : g_trade.Sell(lot, g_sym, 0.0, sl, tp, "MC MANUAL");
+   uint rc = g_trade.ResultRetcode();
+   if(!ok || (rc != TRADE_RETCODE_DONE && rc != TRADE_RETCODE_PLACED))
+     {
+      RegisterReject(rc, g_trade.ResultRetcodeDescription(), "MANUAL");
+      msg = StringFormat("ордер отклонён: %u %s", rc, g_trade.ResultRetcodeDescription());
+      return false;
+     }
+   g_rejectStreak = 0;
+   ulong tk; long id; int pd; double pv, po, psl, ptp;
+   if(!FindPos(tk, id, pd, pv, po, psl, ptp)) { po = entry; id = 0; psl = sl; ptp = tp; pv = lot; }
+   string tname = TypeName(TradeType(d));
+   g_pId = id; g_pDir = d; g_pTrig = "MANUAL"; g_pCls = 0; g_pType = tname; g_pScore = 0; g_pSrcs = "-";
+   g_pSess = SessionName(); g_pStrength = Stars(1); g_pStrN = 1;
+   g_pEntry = po; g_pSL = psl; g_pTP = ptp; g_pLot = pv; g_pLal = 0; g_pRisk = riskUsd;
+   g_pZoneW = 0; g_pZLo = 0; g_pZHi = 0;
+   g_pBEAt = BEAt(MathAbs(ptp - po));
+   g_pOpenT = TimeCurrent(); g_pMark = "MANUAL"; g_pManual = true; g_pWeak = false;
+   g_beDone = false; g_partDone = false; g_exitTag = ""; g_closeRetry = 0;
+   g_day = CalcDay();
+   DrawLine("SL", psl, clrRed);
+   DrawLine("TP", ptp, clrLime);
+   DrawPanel();
+   string cur = AccountInfoString(ACCOUNT_CURRENCY);
+   double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskPct = bal > 0 ? riskUsd / bal * 100.0 : 0;
+   Lg(0, StringFormat("РУЧНАЯ СДЕЛКА %s | вход %s SL %s TP %s | лот %.2f | риск %.2f %s", DirName(d), Px(po), Px(psl), Px(ptp), pv, riskUsd, cur));
+   string fields = JS("symbol", g_sym) + "," + JS("side", DirName(d)) + "," + JI("ticket", g_pId) + "," + JN("entry", po, g_digits) + "," +
+                   JN("sl", psl, g_digits) + "," + JN("tp", ptp, g_digits) + "," + JN("lot", pv, 2) + "," + JN("risk_usd", riskUsd, 2) + "," +
+                   JN("risk_pct", riskPct, 2) + "," + JS("trigger", "MANUAL") + "," + JS("mark", "MANUAL") + "," + JS("type", tname) + "," +
+                   JB("manual", true) + "," + JB("weak", false) + "," + JI("strength", 1) + "," + JS("session", g_pSess) + "," +
+                   JN("rr", MathAbs(ptp - po) / MathMax(MathAbs(po - psl), 0.01), 2) + "," + JN("sl_pts", dist, 1);
+   Emit("trade_opened", 0, "info", fields,
+        StringFormat("%s %s · ручная сделка\nEntry: %s\nSL: %s\nTP: %s\nRR: 1:%.1f\nРиск: %.2f %s (%.2f%%) · лот %.2f\n✋ Ручная сделка из Telegram",
+                     g_sym, DirName(d), Px(po), Px(psl), Px(ptp), rr, riskUsd, cur, riskPct, pv), (int)PERIOD_M5);
+   msg = StringFormat("открыта %s %.2f лота, SL %s, TP %s", DirName(d), pv, Px(psl), Px(ptp));
+   return true;
+  }
+
+bool ExecCmd(string cmd, const string &k[], const string &v[], string &msg, int &shotTf)
+  {
+   shotTf = -1;
+   if(cmd == "ping") { msg = "pong"; return true; }
+   if(cmd == "status") { WriteStatus(); msg = "статус обновлён"; return true; }
+   if(cmd == "pause")
+     {
+      g_set.paused = true;
+      g_pauseReason = "Telegram";
+      SaveSettings();
+      msg = "пауза включена, новые входы остановлены";
+      return true;
+     }
+   if(cmd == "resume")
+     {
+      g_set.paused = false;
+      g_pauseReason = "";
+      g_rejectStreak = 0;
+      g_noSlTries = 0;
+      SaveSettings();
+      AlertSet("orders_rejected", false, "critical", "пауза снята командой resume, отказы ордеров сброшены");
+      msg = "пауза снята, снова ищу входы";
+      return true;
+     }
+   if(cmd == "reset")
+     {
+      bool wasPaused = g_set.paused;
+      SettingsFromInputs();
+      g_set.paused = wasPaused;                    // reset возвращает параметры, а не снимает паузу
+      SaveSettings();
+      DrawPanel();
+      msg = "настройки возвращены к значениям входных параметров";
+      return true;
+     }
+   if(cmd == "chart")
+     {
+      string tfs = JGet(k, v, "args.tf", "M5");
+      ENUM_TIMEFRAMES tf = PERIOD_M5;
+      if(tfs == "M15") tf = PERIOD_M15;
+      else if(tfs == "H1") tf = PERIOD_H1;
+      else if(tfs == "H4") tf = PERIOD_H4;
+      else if(tfs != "M5") { msg = "таймфрейм " + tfs + " не поддерживается (M5, M15, H1, H4)"; return false; }
+      if(!InpShots) { msg = "скрины выключены (InpShots)"; return false; }
+      shotTf = (int)tf;
+      msg = "скрин " + tfs;
+      return true;
+     }
+   if(cmd == "set") return ExecSet(k, v, msg);
+   if(cmd == "open") return ExecOpen(k, v, msg);
+
+   ulong tk; long id; int d; double vol, op, sl, tp;
+   if(cmd == "close" || cmd == "be" || cmd == "modify")
+     {
+      if(!FindPos(tk, id, d, vol, op, sl, tp)) { msg = "открытой позиции нет"; return false; }
+      double cur = d > 0 ? SymbolInfoDouble(g_sym, SYMBOL_BID) : SymbolInfoDouble(g_sym, SYMBOL_ASK);
+      if(cmd == "close")
+        {
+         g_exitTag = "MANUAL";
+         if(!g_trade.PositionClose(tk))
+           {
+            g_exitTag = "";
+            msg = "брокер отклонил закрытие: " + g_trade.ResultRetcodeDescription();
+            return false;
+           }
+         msg = "позиция закрыта по рынку";
+         return true;
+        }
+      if(cmd == "be")
+        {
+         double nsl = NormalizeDouble(op + d * InpBEOffset, g_digits);
+         if(d * (nsl - sl) <= 0) { msg = "стоп уже в безубытке или выше"; return false; }
+         if(d * (cur - nsl) < MinStopDist()) { msg = "прибыль меньше стоп-уровня брокера: безубыток не поставить"; return false; }
+         if(!g_trade.PositionModify(tk, nsl, tp)) { msg = "брокер отклонил: " + g_trade.ResultRetcodeDescription(); return false; }
+         g_beDone = true;
+         g_pSL = nsl;
+         DrawLine("SL", nsl, clrRed);
+         Emit("trade_be", 0, "info", JI("ticket", g_pId) + "," + JN("sl", nsl, g_digits),
+              StringFormat("⚪ %s %s: стоп в безубытке по команде\nSL: %s", g_sym, DirName(d), Px(nsl)), -1);
+         msg = "стоп в безубытке: " + Px(nsl);
+         return true;
+        }
+      // modify: новый стоп и/или тейк
+      double nsl = sl, ntp = tp;
+      bool hS = ParseNum(k, v, "args.sl", nsl), hT = ParseNum(k, v, "args.tp", ntp);
+      if(!hS && !hT) { msg = "нужен новый sl или tp"; return false; }
+      if(hS)
+        {
+         if(nsl <= 0) { msg = "стоп убрать нельзя"; return false; }
+         if(!(d * (cur - nsl) >= MinStopDist())) { msg = "стоп с неправильной стороны от цены или ближе стоп-уровня"; return false; }
+        }
+      if(hT && !(d * (ntp - cur) >= MinStopDist())) { msg = "тейк с неправильной стороны от цены или ближе стоп-уровня"; return false; }
+      nsl = NormalizeDouble(nsl, g_digits);
+      ntp = NormalizeDouble(ntp, g_digits);
+      if(!g_trade.PositionModify(tk, nsl, ntp)) { msg = "брокер отклонил: " + g_trade.ResultRetcodeDescription(); return false; }
+      g_pSL = nsl;
+      g_pTP = ntp;
+      if(d * (nsl - op) >= 0) g_beDone = true;
+      DrawLine("SL", nsl, clrRed);
+      DrawLine("TP", ntp, clrLime);
+      Emit("trade_modified", 0, "info", JI("ticket", g_pId) + "," + JN("sl", nsl, g_digits) + "," + JN("tp", ntp, g_digits),
+           StringFormat("Стоп/тейк изменены: SL %s, TP %s", Px(nsl), Px(ntp)), -1);
+      msg = StringFormat("новые уровни: SL %s, TP %s", Px(nsl), Px(ntp));
+      return true;
+     }
+   msg = "неизвестная команда: " + cmd;
+   return false;
+  }
+
+void RunCommand(string body)
+  {
+   string k[], v[];
+   JParse(body, k, v);
+   string id = JGet(k, v, "id");
+   string cmd = JGet(k, v, "cmd");
+   bool ok = false;
+   string msg = "";
+   int shotTf = -1;
+   if(InpBridgeKey == "") msg = "команды не принимаются: InpBridgeKey пуст";
+   else if(JGet(k, v, "key") != InpBridgeKey) msg = "неверный ключ моста";
+   else
+     {
+      datetime expT = IsoToTime(JGet(k, v, "expires_utc"));
+      if(expT == 0) msg = "нет срока действия команды";
+      else if(expT < TimeGMT()) msg = "команда устарела";
+      else ok = ExecCmd(cmd, k, v, msg, shotTf);
+     }
+   if(!ok) shotTf = -1;
+   Emit("cmd_result", 0, "info", JS("id", id) + "," + JB("ok", ok) + "," + JS("msg", msg),
+        (ok ? "✔️ Готово: " : "✖️ Не выполнено: ") + msg, shotTf);
+  }
+
+// Каждую секунду: файлы cmd\*.json по порядку ts_utc; выполненный или отклонённый файл удаляется
+void ProcessCommands()
+  {
+   string files[];
+   string name;
+   long fh = FileFindFirst(g_dir + "\\cmd\\*.json", name, FILE_COMMON);
+   if(fh == INVALID_HANDLE) return;
+   do
+     {
+      int c = ArraySize(files);
+      ArrayResize(files, c + 1);
+      files[c] = name;
+     }
+   while(FileFindNext(fh, name));
+   FileFindClose(fh);
+   int n = ArraySize(files);
+   if(n == 0) return;
+   string bodies[], stamps[];
+   ArrayResize(bodies, n);
+   ArrayResize(stamps, n);
+   for(int i = 0; i < n; i++)
+     {
+      string t = "";
+      ReadUtf8(g_dir + "\\cmd\\" + files[i], t);
+      bodies[i] = t;
+      string k[], v[];
+      JParse(t, k, v);
+      stamps[i] = JGet(k, v, "ts_utc");
+     }
+   bool done[];
+   ArrayResize(done, n);
+   for(int i = 0; i < n; i++) done[i] = false;
+   for(int step = 0; step < n; step++)
+     {
+      int best = -1;
+      for(int i = 0; i < n; i++)
+        {
+         if(done[i]) continue;
+         if(best < 0 || stamps[i] < stamps[best]) best = i;
+        }
+      if(best < 0) break;
+      done[best] = true;
+      RunCommand(bodies[best]);
+      FileDelete(g_dir + "\\cmd\\" + files[best], FILE_COMMON);
+     }
+  }
+
+void OnTimer()
+  {
+   if(!g_bridgeOn) return;
+   ProcessCommands();
+   ulong ms = GetTickCount64();
+   if(ms - g_lastStatusMs >= (ulong)MathMax(1, InpStatusSec) * 1000)
+     {
+      g_lastStatusMs = ms;
+      ReadHeartbeat();
+      WriteStatus();
+     }
+   if(ms - g_lastAlertMs >= 5000)
+     {
+      g_lastAlertMs = ms;
+      CheckAlerts();
+      CheckScheduled();
+     }
+   CheckZoneTouch();
+   DrainTG();
+  }
+
+string BridgeLine()
+  {
+   string s = "";
+   if(g_set.paused) s += "ПАУЗА (" + g_pauseReason + ")\n";
+   if(!g_bridgeOn) return s + "Бот: мост выключен\n";
+   if(InpBridgeKey == "") s += "⚠️ InpBridgeKey пуст: команды не принимаются\n";
+   if(g_botAlive) s += "Бот: онлайн\n";
+   else
+     {
+      datetime ref = g_botHb > 0 ? g_botHb : g_startUtc;
+      s += "Бот: нет связи " + IntegerToString((long)((TimeGMT() - ref) / 60)) + " мин\n";
+     }
+   return s;
+  }
+
+string DeinitText(int reason)
+  {
+   switch(reason)
+     {
+      case REASON_REMOVE:      return "снят с графика";
+      case REASON_RECOMPILE:   return "перекомпиляция";
+      case REASON_CHARTCHANGE: return "смена символа или периода графика";
+      case REASON_CHARTCLOSE:  return "график закрыт";
+      case REASON_PARAMETERS:  return "изменены параметры";
+      case REASON_ACCOUNT:     return "смена счёта";
+      case REASON_TEMPLATE:    return "применён шаблон";
+      case REASON_INITFAILED:  return "ошибка запуска";
+      case REASON_CLOSE:       return "закрытие терминала";
+      case REASON_PROGRAM:     return "советник остановил сам себя";
+     }
+   return "причина " + IntegerToString(reason);
   }
 
 //+------------------------------------------------------------------+
@@ -2506,13 +3732,26 @@ int OnInit()
    g_k = 1.0;
    g_ks = 1.0;
    g_crypto = false;
+   g_bridgeOn = InpBridge && !g_isTester;
+   g_robotId = IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "_" + IntegerToString(InpMagic);
+   g_dir = "MrCasino\\" + g_robotId;
+   g_startUtc = TimeGMT();
+   g_lastTickMs = GetTickCount64();
+   SettingsFromInputs();
+   if(g_bridgeOn)
+     {
+      EnsureDirs();
+      LoadSettings();
+      if(InpBridgeKey == "")
+         Print("Внимание: InpBridgeKey пуст, команды из Telegram не принимаются.");
+     }
    g_quotaMin = ParseHM(InpQuotaFrom);
    Print(StringFormat("Стоп %.1f–%.1f (True Stop %s), %s, безубыток после %.2f пути, сделок в день %d, слабые подтверждения %s",
                       InpMinSL, InpMaxSL, InpTrueStop ? "вкл" : "выкл",
-                      InpTPMode == TP_RR ? StringFormat("тейк RR 1:%.1f", InpRR)
+                      InpTPMode == TP_RR ? StringFormat("тейк RR 1:%.1f", g_set.rr)
                                          : StringFormat("тейк %.1f–%.1f (LAL, RR от %.1f)", InpTPMin, InpTPMax, InpMinRR),
-                      InpBEFrac, InpMaxTradesDay, InpWeakSignals ? "вкл" : "выкл (добор с " + InpQuotaFrom + ")"));
-   Print(StringFormat("Риск: %.2f%% на сделку, в день до %.1f%% баланса%s", TradeRiskPct(EffectiveRiskMode()), InpDailyRiskPct,
+                      InpBEFrac, g_set.maxTrades, g_set.weak ? "вкл" : "выкл (добор с " + InpQuotaFrom + ")"));
+   Print(StringFormat("Риск: %.2f%% на сделку, в день до %.1f%% баланса%s", TradeRiskPct(EffectiveRiskMode()), g_set.dailyRiskPct,
                       EffectiveRiskMode() == RISK_FIXED ? " (режим FIXED: лот " + DoubleToString(InpFixedLot, 2) + ", дневной лимит действует)" : ""));
    g_sessStart = ParseHM(InpSessionStart);
    g_sessEnd = ParseHM(InpSessionEnd);
@@ -2535,19 +3774,35 @@ int OnInit()
    g_lastM5 = 0; g_lastM15 = 0; g_lastH1 = 0;
    g_day = CalcDay();
    ManagePosition();
-   Print("Mr. Casino v3.2 запущен: ", g_sym, ", риск ", EnumToString(EffectiveRiskMode()), ", магик ", InpMagic,
+   Print("Mr. Casino v3.3 запущен: ", g_sym, ", риск ", EnumToString(EffectiveRiskMode()), ", магик ", InpMagic,
          ", лог-уровень ", InpLogLevel, ", Бишкек ", LocalHM());
+   if(g_bridgeOn)
+     {
+      EventSetTimer(1);
+      Emit("ea_started", 0, "info", JS("version", "3.30") + "," + JI("login", AccountInfoInteger(ACCOUNT_LOGIN)) + "," + JS("symbol", g_sym) + "," +
+           JN("risk_pct", TradeRiskPct(EffectiveRiskMode()), 2) + "," + JN("daily_risk_pct", g_set.dailyRiskPct, 2) + "," +
+           JI("max_trades", g_set.maxTrades) + "," + JN("rr", g_set.rr, 2),
+           StringFormat("▶️ Робот запущен: v3.3 · %s · %s · %s · риск %g%% / %g%% в день", g_sym, AccountInfoString(ACCOUNT_SERVER),
+                        AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_REAL ? "реальный счёт" : "демо",
+                        TradeRiskPct(EffectiveRiskMode()), g_set.dailyRiskPct), -1);
+     }
    return INIT_SUCCEEDED;
   }
 
 void OnDeinit(const int reason)
   {
+   if(g_bridgeOn)
+     {
+      EventKillTimer();
+      Emit("ea_stopped", 0, "info", JS("reason", DeinitText(reason)), "⏹ Робот остановлен: " + DeinitText(reason), -1);
+     }
    ObjectsDeleteAll(0, OBJ_PREFIX);
    Comment("");
   }
 
 void OnTick()
   {
+   g_lastTickMs = GetTickCount64();
    ManagePosition();
    datetime t = iTime(g_sym, PERIOD_M5, 0);
    if(t == 0) return;

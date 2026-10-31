@@ -149,8 +149,13 @@ class FakeEA:
         self.day["trades"] += 1
         p = self.position
         self.emit("trade_opened", 0, "info",
-                  {"ticket": p["ticket"], "side": side, "entry": entry, "sl": p["sl"], "tp": p["tp"], "lot": lot,
-                   "risk_usd": p["risk"], "trigger": p["trigger"], "manual": manual, "shot": ""},
+                  {"symbol": self.symbol, "ticket": p["ticket"], "side": side, "entry": entry, "sl": p["sl"], "tp": p["tp"],
+                   "lot": lot, "risk_usd": p["risk"], "risk_pct": round(risk_pct, 2), "trigger": p["trigger"],
+                   "mark": "FU", "fu_class": "B", "type": "WITH", "manual": manual, "weak": False, "strength": 2,
+                   "zone_lo": round(entry - sl_pts - 1, 2) if side == "BUY" else round(entry + 1, 2),
+                   "zone_hi": round(entry - 1, 2) if side == "BUY" else round(entry + sl_pts + 1, 2), "score": 4,
+                   "srcs": "H1 OB + M15 FU", "htf": True, "session": "LONDON", "rr": rr, "sl_src": "True Stop за зоной",
+                   "sl_pts": sl_pts, "tp_pts": round(sl_pts * rr, 1), "shot": ""},
                   f"{'🟢' if side == 'BUY' else '🔴'} {self.symbol} {side} · сделка {self.day['trades']}/{self.set['max_trades']}")
         return p
 
@@ -302,7 +307,9 @@ class FakeEA:
         return True, f"открыта {p['side']} {p['lot']} лота, SL {p['sl']}, TP {p['tp']}", {}
 
     def _cmd_reset(self, a):
+        paused = self.set["paused"]
         self.set = dict(DEFAULTS)
+        self.set["paused"] = paused           # как в роботе: reset возвращает параметры, паузу не снимает
         self._save_settings()
         return True, "настройки возвращены к значениям из входных параметров", {}
 

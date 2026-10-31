@@ -70,7 +70,7 @@ class Notifier:
             return                                          # ответ на команду уже передал ассистент
         st = self.hub.status()
         cur = st.get("account", "currency", default="USD") if st else "USD"
-        text = event_text(ev, self.s.zone, cur)
+        text = event_text(ev, self.s.zone, cur, status=st)
         photo = self._shot(ev)
         reply_to = None
         ticket = ev.data.get("ticket")
@@ -137,7 +137,7 @@ class Notifier:
         sev = ev.data.get("severity") or ev.severity or "warning"
         st = self.hub.status()
         cur = st.get("account", "currency", default="USD") if st else "USD"
-        text = event_text(ev, self.s.zone, cur)
+        text = event_text(ev, self.s.zone, cur, status=st)
         if state == "closed":
             self.open_alerts.pop(key, None)
             self.acked.discard(key)
