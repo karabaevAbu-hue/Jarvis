@@ -33,7 +33,7 @@ EventKillTimer GetTickCount64 TerminalInfoInteger AccountInfoInteger SymbolInfoS
 StringSubstr StringFind StringLen StringFormat IntegerToString DoubleToString ArrayResize ArraySize NormalizeDouble
 MathAbs MathMax MathMin MathRound MathFloor PositionGetInteger PositionGetDouble PositionGetString TimeGMT TimeCurrent
 SendNotification WebRequest Print GetLastError SymbolInfoDouble SymbolInfoInteger AccountInfoDouble AccountInfoString
-ObjectFind ObjectDelete ObjectSetDouble ObjectSetString ObjectsDeleteAll Comment MQLInfoInteger EnumToString
+ObjectFind ObjectDelete ObjectSetDouble ObjectSetString ObjectsDeleteAll Comment MQLInfoInteger EnumToString FileIsExist FileCopy
 """.split()
 
 

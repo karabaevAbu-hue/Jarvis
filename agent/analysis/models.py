@@ -121,19 +121,6 @@ class Figure:
 
 
 @dataclass
-class Source:
-    """Один источник для зоны."""
-    kind: str            # OB, FU, HCS, RETEST, NEG
-    tf: str
-    dir: str
-    lo: float
-    hi: float
-    weight: int
-    label: str
-    detail: str = ""
-
-
-@dataclass
 class Plan:
     entry_ref: float
     sl: float
@@ -154,7 +141,6 @@ class Zone:
     score: int
     type: str                        # WITH | MIXED | COUNTER
     srcs: list[str] = field(default_factory=list)
-    sources: list[Source] = field(default_factory=list)
     htf: bool = False
     dist: float = 0.0
     hcs: int = 0
@@ -168,13 +154,12 @@ class Zone:
 
     @property
     def stars(self) -> str:
-        return "★★★" if self.score >= 6 else "★★" if self.score >= 3 else "★"
+        return "★★★" if self.score >= 7 else "★★" if self.score >= 5 else "★"   # шкала Stars() робота
 
     def to_dict(self) -> dict:
         d = asdict(self)
         d["width"] = round(self.width, 2)
         d["stars"] = self.stars
-        d.pop("sources", None)
         return d
 
 
@@ -194,3 +179,4 @@ class AnalysisResult:
     frames_ok: dict[str, int] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     robot_diff: list[str] = field(default_factory=list)
+    robot_zones: list[dict] = field(default_factory=list)   # торгуемые зоны по правилам робота (для сверки)

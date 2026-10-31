@@ -41,7 +41,8 @@ class Candles:
 
 def from_rows(rows: list[tuple[float, float, float, float]], tf: str = "H1", start: str = "2026-01-05") -> Candles:
     """Для тестов: список (o,h,l,c) -> Candles с часовым индексом."""
-    idx = pd.date_range(start, periods=len(rows), freq=pd.Timedelta(hours=1) if tf != "M15" else "15min", tz="UTC")
+    freq = {"M5": "5min", "M15": "15min", "H1": "1h", "H4": "4h", "D1": "1D"}.get(tf, "1h")
+    idx = pd.date_range(start, periods=len(rows), freq=freq, tz="UTC")
     df = pd.DataFrame(rows, columns=["open", "high", "low", "close"], index=idx)
     return Candles(df, tf)
 

@@ -15,7 +15,9 @@ import pandas as pd
 log = logging.getLogger("data_mt5")
 
 GOLD_CANDIDATES = ["XAUUSDm", "XAUUSDc", "XAUUSD", "GOLD#", "GOLD", "XAUUSD.a"]
-TF_BARS = {"W1": 100, "D1": 200, "H4": 300, "H1": 500, "M15": 500, "M5": 300}
+# сколько свечей читает робот: M5 до 900 (повтор истории зоны), M15 до 700 (MaxOverlap), H1 130, H4 70, D1 40.
+# W1 и D1 в зонах робота не участвуют (OB у него только H4, H1, M15); D1 нужен для bias.
+TF_BARS = {"D1": 60, "H4": 100, "H1": 500, "M15": 700, "M5": 900}
 
 
 class MT5Unavailable(RuntimeError):
@@ -128,7 +130,7 @@ class MT5Source:
 
 
 def load_frames(source: CandleSource, symbol: str, tfs: tuple[str, ...] = tuple(TF_BARS)) -> dict[str, pd.DataFrame]:
-    """W1(100), D1(200), H4(300), H1(500), M15(500), M5(300) — раздел 12 ТЗ."""
+    """Свечи в объёме, который читает робот (см. TF_BARS)."""
     frames: dict[str, pd.DataFrame] = {}
     for tf in tfs:
         try:
