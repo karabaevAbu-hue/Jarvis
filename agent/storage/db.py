@@ -85,6 +85,22 @@ class Database:
             row = await cur.fetchone()
         return dict(row)
 
+    # ---------- ожидающие подтверждения ----------
+    async def pending_put(self, pid: str, kind: str, args: dict, prompt: str, created: float, expires: float) -> None:
+        await self.db.execute(
+            "INSERT OR REPLACE INTO pending_action(id,kind,args,prompt,created,expires,status) VALUES(?,?,?,?,?,?,'pending')",
+            (pid, kind, json.dumps(args, ensure_ascii=False), prompt, created, expires))
+        await self.db.commit()
+
+    async def pending_set_status(self, pid: str, status: str, only_if: str | None = None) -> bool:
+        """Меняет статус; с only_if — только если сейчас именно он (одноразовость). Возвращает, получилось ли."""
+        if only_if:
+            cur = await self.db.execute("UPDATE pending_action SET status=? WHERE id=? AND status=?", (status, pid, only_if))
+        else:
+            cur = await self.db.execute("UPDATE pending_action SET status=? WHERE id=?", (status, pid))
+        await self.db.commit()
+        return cur.rowcount > 0
+
     # ---------- журнал действий ----------
     async def log_action(self, kind: str, args: dict, who: str, confirmed_text: str | None, result: str | None) -> None:
         await self.db.execute(

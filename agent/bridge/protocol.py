@@ -23,6 +23,8 @@ SET_RANGES = {
     "rr": (1.0, 5.0),
 }
 SET_BOOLS = ("weak", "buy", "sell")
+LABELS = {"risk_pct": "риск на сделку, %", "daily_risk_pct": "дневной риск, %", "max_trades": "максимум сделок в день",
+          "rr": "RR", "sl_pts": "стоп, пункты", "weak": "слабые сигналы", "buy": "BUY", "sell": "SELL"}
 OPEN_SL_MAX_PTS = 50.0
 
 NO_ARGS_CMDS = ("pause", "resume", "close", "be", "reset", "ping", "status")
@@ -118,27 +120,27 @@ def validate_command(cmd: str, args: dict[str, Any] | None) -> tuple[bool, str]:
             if k in args:
                 v = args[k]
                 if not _is_num(v) or not (lo <= v <= hi):
-                    return False, f"{k}: допустимо от {lo} до {hi}"
+                    return False, f"{LABELS[k]}: допустимо от {lo:g} до {hi:g}"
                 if k == "max_trades" and int(v) != v:
-                    return False, "max_trades: нужно целое число"
+                    return False, "максимум сделок: нужно целое число"
         for k in SET_BOOLS:
             if k in args and not isinstance(args[k], bool):
-                return False, f"{k}: нужно true или false"
+                return False, f"{LABELS[k]}: нужно да или нет"
         return True, "ok"
     if cmd == "open":
         if args.get("side") not in ("BUY", "SELL"):
             return False, "side: BUY или SELL"
         sl = args.get("sl_pts")
         if not _is_num(sl) or not (0 < sl <= OPEN_SL_MAX_PTS):
-            return False, f"sl_pts: стоп обязателен, от 0 до {OPEN_SL_MAX_PTS:g} пунктов"
+            return False, f"стоп обязателен: от 0 до {OPEN_SL_MAX_PTS:g} пунктов"
         if "risk_pct" in args:
             lo, hi = SET_RANGES["risk_pct"]
             if not _is_num(args["risk_pct"]) or not (lo <= args["risk_pct"] <= hi):
-                return False, f"risk_pct: допустимо от {lo} до {hi}"
+                return False, f"{LABELS['risk_pct']}: допустимо от {lo:g} до {hi:g}"
         if "rr" in args:
             lo, hi = SET_RANGES["rr"]
             if not _is_num(args["rr"]) or not (lo <= args["rr"] <= hi):
-                return False, f"rr: допустимо от {lo} до {hi}"
+                return False, f"RR: допустимо от {lo:g} до {hi:g}"
         return True, "ok"
     return False, "не проверено"
 

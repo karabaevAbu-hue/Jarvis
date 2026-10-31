@@ -113,6 +113,11 @@ class MT5Source:
         deals = mt5.history_deals_get(now - pd.Timedelta(days=days), now)
         return [d._asdict() for d in deals] if deals else []
 
+    def data_path(self) -> str | None:
+        """Папка данных терминала (там MQL5\\Logs)."""
+        info = self._api().terminal_info()
+        return info.data_path if info else None
+
     def find_symbol(self, preferred: str = "") -> str | None:
         mt5 = self._api()
         for name in ([preferred] if preferred else []) + GOLD_CANDIDATES:

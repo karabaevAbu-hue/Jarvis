@@ -111,3 +111,24 @@ class EventReader:
     @staticmethod
     def _has_partial(path, offset: int) -> bool:
         return path.stat().st_size > offset
+
+
+def read_recent(paths: BridgePaths, n: int = 20, types: set[str] | None = None, max_files: int = 4) -> list[Event]:
+    """Последние n событий из лент (новые в конце). Для инструментов get_events / explain_skips."""
+    d = paths.events_dir
+    if not d.is_dir():
+        return []
+    out: list[Event] = []
+    for f in sorted(d.glob("*.jsonl"), reverse=True)[:max_files]:
+        part: list[Event] = []
+        for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                ev = Event.from_json(json.loads(line))
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if types is None or ev.type in types:
+                part.append(ev)
+        out = part + out
+        if len(out) >= n:
+            break
+    return out[-n:]
