@@ -1,0 +1,8 @@
+# Только для ПК с MT5 (Windows 10/11). Ставит install.bat.
+-r requirements.txt
+MetaTrader5>=5.0.45          # цены и счёт из запущенного терминала
+faster-whisper>=1.0          # голос -> текст, локально
+silero-vad>=5.1              # конец фразы (нужен torch)
+pyrofork>=2.3                # Telegram-клиент (Pyrogram-форк); см. agent/tg/client.py
+tgcrypto>=1.2                # ускорение шифрования Telegram
+py-tgcalls>=2.0              # звонки 1:1 (проверяется шагом 2 плана)

@@ -1,0 +1,31 @@
+# Секреты: только на ПК, в репозиторий не попадают
+.env
+*.session
+*.session-journal
+data/*
+!data/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# Модели и кэш озвучки
+models/
+cache/
+*.onnx
+
+# Скрины и выгрузки моста
+shots/
+*.png
+!docs/*.png
+!tests/fixtures/*.png
+
+# Windows / редакторы
+Thumbs.db
+.idea/
+.vscode/
+*.ex5
