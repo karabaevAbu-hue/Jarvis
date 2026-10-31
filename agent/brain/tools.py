@@ -37,7 +37,7 @@ class OutMsg:
 class ToolContext:
     settings: Settings
     db: Database
-    hub: BridgeHub | None
+    hub: Any                      # BridgeHub или LazyHub: status(), paths, command()
     confirm: ConfirmManager
     engine: AnalysisEngine | None = None
     outbox: list[OutMsg] = field(default_factory=list)
@@ -283,7 +283,7 @@ async def _tool_get_price(ctx: ToolContext, a: dict) -> dict:
 
 
 def _trades(ctx: ToolContext) -> list[dict]:
-    if not ctx.hub:
+    if not ctx.hub or ctx.hub.paths is None:
         return []
     return read_trades(ctx.hub.paths.trades_csv)
 
@@ -368,14 +368,14 @@ async def _tool_get_chart(ctx: ToolContext, a: dict) -> dict:
 
 
 async def _tool_explain_skips(ctx: ToolContext, a: dict) -> dict:
-    if not ctx.hub:
+    if not ctx.hub or ctx.hub.paths is None:
         return {"error": "нет моста"}
     evs = read_recent(ctx.hub.paths, int(a.get("n", 8)), {"signal_skipped", "analysis_skip"})
     return {"skips": [{"time": e.ts_local, "type": e.type, "text": e.text, "data": e.data} for e in evs]}
 
 
 async def _tool_get_events(ctx: ToolContext, a: dict) -> dict:
-    if not ctx.hub:
+    if not ctx.hub or ctx.hub.paths is None:
         return {"error": "нет моста"}
     evs = read_recent(ctx.hub.paths, int(a.get("n", 10)))
     return {"events": [{"seq": e.seq, "time": e.ts_local, "type": e.type, "severity": e.severity, "text": e.text}

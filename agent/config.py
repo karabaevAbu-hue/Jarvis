@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     # Мост
     bridge_key: str = ""
     bridge_root: str = ""
+    bridge_robot: str = ""       # папка <login>_<magic>; пусто = единственная найденная или свежая по status.json
     mt5_path: str = r"C:\Program Files\MetaTrader 5\terminal64.exe"
     mt5_autorestart: bool = True
     symbol: str = ""

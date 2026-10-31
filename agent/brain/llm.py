@@ -184,8 +184,11 @@ class LLM:
         result = TurnResult("", model=model)
 
         for _ in range(max_iters):
-            resp = await self._create(kind, model=model, max_tokens=max_tokens, system=system, messages=msgs,
-                                      tools=tools, output_config={"effort": effort})
+            kw: dict[str, Any] = dict(model=model, max_tokens=max_tokens, system=system, messages=msgs,
+                                      output_config={"effort": effort})
+            if tools:
+                kw["tools"] = tools
+            resp = await self._create(kind, **kw)
             result.cost += await self.budget.record(kind, model, resp.usage)
             result.stop_reason = resp.stop_reason or ""
             if resp.stop_reason == "refusal":

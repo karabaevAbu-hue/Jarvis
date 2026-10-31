@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import io
+import logging
 
 import matplotlib
 
 matplotlib.use("Agg")
+logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
 import matplotlib.pyplot as plt  # noqa: E402
 import mplfinance as mpf  # noqa: E402
 import pandas as pd  # noqa: E402

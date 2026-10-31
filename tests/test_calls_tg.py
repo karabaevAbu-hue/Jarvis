@@ -55,6 +55,9 @@ class FakeSTT:
     async def transcribe_pcm16k(self, pcm):
         return NS(text=self.texts.pop(0) if self.texts else "", confidence=self.conf)
 
+    async def transcribe_file(self, path):
+        return await self.transcribe_pcm16k(b"")
+
 
 class FakeAssistant:
     def __init__(self, reply="Работает.", delay=0.0):

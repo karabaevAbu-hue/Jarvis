@@ -161,3 +161,28 @@ class BridgeHub:
                     p.unlink(missing_ok=True)
                     removed[key] += 1
         return removed
+
+
+class LazyHub:
+    """Мост, который появляется, когда найдена папка робота. До этого команды честно отвечают «робот не найден»."""
+
+    def __init__(self) -> None:
+        self.inner: BridgeHub | None = None
+
+    def attach(self, hub: BridgeHub) -> None:
+        self.inner = hub
+
+    def __bool__(self) -> bool:
+        return self.inner is not None
+
+    @property
+    def paths(self):
+        return self.inner.paths if self.inner else None
+
+    def status(self):
+        return self.inner.status() if self.inner else None
+
+    async def command(self, cmd, args=None, timeout: float = 10.0) -> CmdResult:
+        if not self.inner:
+            return CmdResult(False, "робот не найден: нет папки моста")
+        return await self.inner.command(cmd, args, timeout)

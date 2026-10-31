@@ -101,6 +101,27 @@ class Database:
         await self.db.commit()
         return cur.rowcount > 0
 
+    # ---------- тревоги ----------
+    async def alert_open(self, key: str, severity: str, text: str) -> None:
+        await self.db.execute(
+            "INSERT INTO alerts(key,severity,opened,closed,text,acked,call_attempts) VALUES(?,?,?,NULL,?,0,0) "
+            "ON CONFLICT(key) DO UPDATE SET severity=excluded.severity, opened=excluded.opened, closed=NULL, "
+            "text=excluded.text, acked=0, call_attempts=0", (key, severity, time.time(), text))
+        await self.db.commit()
+
+    async def alert_close(self, key: str) -> None:
+        await self.db.execute("UPDATE alerts SET closed=? WHERE key=? AND closed IS NULL", (time.time(), key))
+        await self.db.commit()
+
+    async def alert_ack_all(self) -> int:
+        cur = await self.db.execute("UPDATE alerts SET acked=1 WHERE closed IS NULL AND acked=0")
+        await self.db.commit()
+        return cur.rowcount
+
+    async def alerts_open(self) -> list[dict]:
+        async with self.db.execute("SELECT * FROM alerts WHERE closed IS NULL ORDER BY opened") as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
     # ---------- журнал действий ----------
     async def log_action(self, kind: str, args: dict, who: str, confirmed_text: str | None, result: str | None) -> None:
         await self.db.execute(
