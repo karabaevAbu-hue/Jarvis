@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from pathlib import Path
@@ -47,6 +48,7 @@ class Assistant:
         self.mem = memory
         self.system_static = system_static if system_static is not None else load_system_static()
         self.clock = clock
+        self._lock = asyncio.Lock()          # текст и звонок идут по одному: общий outbox и одно «да»
         self.ack_callbacks: list[Callable[[], None]] = []
         self.tradingview_hint_sent = False
 
@@ -68,6 +70,10 @@ class Assistant:
     # ------------------------------------------------------------ основной вход
     async def handle(self, text: str, *, forwarded: bool = False, confidence: float = 1.0,
                      voice: bool = False) -> list[OutMsg]:
+        async with self._lock:
+            return await self._handle(text, forwarded=forwarded, confidence=confidence, voice=voice)
+
+    async def _handle(self, text: str, *, forwarded: bool, confidence: float, voice: bool) -> list[OutMsg]:
         self.ctx.outbox = []
 
         # 1. «да» проверяет код; модель к этому не допускается
