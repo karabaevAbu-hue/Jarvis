@@ -16,7 +16,7 @@ log = logging.getLogger("data_mt5")
 
 GOLD_CANDIDATES = ["XAUUSDm", "XAUUSDc", "XAUUSD", "GOLD#", "GOLD", "XAUUSD.a"]
 # сколько свечей читает робот: M5 до 900 (повтор истории зоны), M15 до 700 (MaxOverlap), H1 130, H4 70, D1 40.
-# W1 и D1 в зонах робота не участвуют (OB у него только H4, H1, M15); D1 нужен для bias.
+# W1 и D1 в зонах робота не участвуют (OB у v3.4 только H4 и H1, M15 OB выключен по умолчанию); D1 нужен для bias.
 TF_BARS = {"D1": 60, "H4": 100, "H1": 500, "M15": 700, "M5": 900}
 
 
@@ -114,6 +114,15 @@ class MT5Source:
         now = datetime.now(timezone.utc)
         deals = mt5.history_deals_get(now - pd.Timedelta(days=days), now)
         return [d._asdict() for d in deals] if deals else []
+
+    def terminal_state(self) -> dict[str, Any]:
+        """Состояние терминала для самопроверки: связь с брокером, алготорговля, счёт (демо или реальный)."""
+        mt5 = self._api()
+        ti, ai = mt5.terminal_info(), mt5.account_info()
+        demo_mode = getattr(mt5, "ACCOUNT_TRADE_MODE_DEMO", 0)
+        return {"connected": bool(ti.connected) if ti else False, "trade_allowed": bool(ti.trade_allowed) if ti else False,
+                "login": int(ai.login) if ai else 0, "server": str(ai.server) if ai else "",
+                "demo": (ai.trade_mode == demo_mode) if ai else None}
 
     def data_path(self) -> str | None:
         """Папка данных терминала (там MQL5\\Logs)."""

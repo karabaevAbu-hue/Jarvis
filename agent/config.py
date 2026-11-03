@@ -72,10 +72,12 @@ class Settings(BaseSettings):
     evening_zones_hm: str = "22:30"
     weekly: str = "Sat 10:00"
 
-    # Голос
+    # Голос. По умолчанию выключен: ассистент работает текстом и не тянет torch/whisper (сервер 4 ГБ вместе с MT5).
+    # VOICE_ENABLED=true включает: голосовые сообщения (Whisper), озвучку ответов, звонки (py-tgcalls).
+    voice_enabled: bool = False
     voice: str = "ru-RU-DmitryNeural"
     voice_trades: bool = False
-    stt_model: str = "small"
+    stt_model: str = "base"
     stt_device: str = "auto"
     call_on_critical: bool = True
     call_max_min: int = 15

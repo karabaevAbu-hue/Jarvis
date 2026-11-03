@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import struct
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
@@ -197,6 +198,25 @@ class PyrogramTransport:
     async def stop(self) -> None:
         await self.app.stop()
 
+    async def owner_known(self) -> bool:
+        """Знает ли аккаунт ассистента владельца (его access_hash в кэше сессии).
+
+        У свежей сессии кэш пуст: писать по числовому id нельзя, пока Абу не написал ассистенту первым и
+        обновление не попало в кэш. Прогреваем кэш диалогами; если Абу там нет, False (ассистент всё равно
+        слушает и ответит, как только Абу напишет).
+        """
+        try:
+            async for d in self.app.get_dialogs(limit=100):
+                if d.chat and d.chat.id == self.owner_id:
+                    return True
+        except Exception as e:                                         # не мешаем запуску
+            log.warning("диалоги не прочитаны: %s", e)
+        try:
+            await self.app.get_users(self.owner_id)
+            return True
+        except Exception:
+            return False
+
     @staticmethod
     def _wrap(e: Exception) -> Exception:
         try:
@@ -245,3 +265,47 @@ class PyrogramTransport:
 
     async def download_voice(self, m: Any, dest: str) -> str:
         return await m.download(file_name=dest)
+
+
+# ------------------------------------------------------------------ пробник для --selftest
+class PyrogramProbe:
+    """Подключение к Telegram для самопроверки: не задаёт вопросов в консоли и ничего не запускает, кроме связи.
+
+    connect() без authorize(): на неавторизованной сессии вернёт False, а не спросит код. Запись в сессию
+    (peers) ведёт та же sqlite, поэтому при работающем ассистенте connect упадёт «database is locked».
+    """
+
+    def __init__(self, api_id: int, api_hash: str, phone: str, workdir: str, name: str = "consigliere"):
+        from pyrogram import Client
+        self.app = Client(name, api_id=api_id, api_hash=api_hash, phone_number=phone or None, workdir=workdir,
+                          no_updates=True)
+
+    async def connect(self) -> bool:
+        try:
+            return await self.app.connect()
+        except (KeyError, ValueError, struct.error) as e:          # на рукопожатии пришёл не ответ Telegram
+            raise ConnectionError("ответ сервера не похож на Telegram: трафик, вероятно, перехватывает прокси "
+                                  "или фильтр, либо мешает брандмауэр") from e
+
+    async def me(self) -> dict:
+        m = await self.app.get_me()
+        return {"id": m.id, "name": " ".join(x for x in (m.first_name, m.last_name) if x) or str(m.id),
+                "username": m.username or "", "phone": getattr(m, "phone_number", "") or ""}
+
+    async def owner(self, owner_id: int) -> dict:
+        """Находит владельца: сначала в диалогах (кэш пиров), затем напрямую. PeerIdInvalid, если не знает."""
+        async for d in self.app.get_dialogs(limit=100):
+            if d.chat and d.chat.id == owner_id:
+                c = d.chat
+                return {"id": c.id, "name": " ".join(x for x in (c.first_name, c.last_name) if x) or str(c.id)}
+        u = await self.app.get_users(owner_id)
+        return {"id": u.id, "name": " ".join(x for x in (u.first_name, u.last_name) if x) or str(u.id)}
+
+    async def send(self, owner_id: int, text: str) -> int:
+        return (await self.app.send_message(owner_id, text)).id
+
+    async def disconnect(self) -> None:
+        try:
+            await self.app.disconnect()
+        except Exception:
+            pass

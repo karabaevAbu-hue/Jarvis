@@ -1,7 +1,7 @@
 """Запуск ассистента.
 
     start_agent.bat --login      первый вход аккаунта ассистента (код из Telegram + пароль 2FA)
-    start_agent.bat --selftest   проверка MT5, моста, Claude, Whisper, озвучки
+    start_agent.bat --selftest   проверка Telegram, моста, MT5, Claude (--no-send: без тестового сообщения)
     start_agent.bat              работа
     python -m agent.main --console [--fake-robot]   диалог в терминале без Telegram (разработка и проверка)
 """
@@ -61,6 +61,9 @@ class ConsoleTransport:
 
 
 def build_stt_tts(s: Settings):
+    """Голос выключен (VOICE_ENABLED=false, по умолчанию): (None, None), ни whisper, ни torch не импортируются."""
+    if not s.voice_enabled:
+        return None, None
     from agent.speech.stt import STT
     from agent.speech.tts import TTS
     return (STT(s.stt_model, s.stt_device, str(Path(s.data_dir) / "models")),
@@ -127,33 +130,42 @@ async def run_login(s: Settings) -> int:
     return 0
 
 
-async def run_selftest(s: Settings) -> int:
+async def run_selftest(s: Settings, send_test: bool = True) -> int:
+    """Проверки по отдельности: настройки, Telegram (вход, владелец, отправка), мост (папка, статус, ping), MT5, Claude."""
     from agent import selftest as st
     from agent.analysis.data_mt5 import MT5Source
     from agent.bridge.hub import BridgeHub
     from agent.brain.llm import LLM
     from agent.storage.db import Database
+    from agent.tg.client import PyrogramProbe
 
     db = await Database(s.db_path).open()
     source = MT5Source(s.mt5_path)
-    stt, tts = build_stt_tts(s)
     paths = find_robot(s)
     hub = BridgeHub(paths, db, s.bridge_key) if paths else None
-    checks = [("Настройки", lambda: st.check_config(s)), ("ffmpeg", st.check_ffmpeg),
-              ("Диск", lambda: st.check_disk(s)), ("MT5", lambda: st.check_mt5(source, s.symbol)),
-              ("Мост", lambda: st.check_bridge(hub, paths, s.bridge_key)),
-              ("Claude", lambda: st.check_claude(LLM(s, db))), ("Whisper", lambda: st.check_whisper(stt)),
-              ("Озвучка", lambda: st.check_tts(tts)), ("Сессия Telegram", lambda: st.check_telegram_session(s))]
-    code = await st.run_selftest(checks)
-    await db.close()
-    return code
+    tg = st.TelegramCheck(s, lambda: PyrogramProbe(s.tg_api_id, s.tg_api_hash, s.tg_phone, s.data_dir),
+                          send_test=send_test)
+    checks = [("Настройки", lambda: st.check_config(s)), ("Диск", lambda: st.check_disk(s)),
+              ("Telegram: вход", tg.login), ("Telegram: владелец", tg.owner), ("Telegram: отправка", tg.send),
+              ("Мост с роботом", lambda: st.check_bridge(hub, paths, s.bridge_key)),
+              ("MT5", lambda: st.check_mt5(source, s.symbol, s.mt5_path)),
+              ("Claude", lambda: st.check_claude(LLM(s, db))), ("Голос", lambda: st.check_voice_flag(s))]
+    if s.voice_enabled:
+        stt, tts = build_stt_tts(s)
+        checks += [("ffmpeg", st.check_ffmpeg), ("Whisper", lambda: st.check_whisper(stt)),
+                   ("Озвучка", lambda: st.check_tts(tts)), ("Звонки (py-tgcalls)", st.check_calls_lib)]
+    try:
+        return await st.run_selftest(checks)
+    finally:
+        await tg.close()
+        source.shutdown()
+        await db.close()
 
 
 async def run_agent(s: Settings) -> int:
     from agent.analysis.data_mt5 import MT5Source
     from agent.bridge.direct import make_direct_closer
     from agent.storage.db import Database
-    from agent.tg.calls import PyTgCallsBackend
     from agent.tg.client import Messenger, PyrogramTransport
 
     for p in s.problems():
@@ -161,11 +173,20 @@ async def run_agent(s: Settings) -> int:
     if not (s.tg_api_id and s.tg_api_hash and s.owner_id):
         log.error("Нужны TG_API_ID, TG_API_HASH, OWNER_ID в .env")
         return 2
+    if not Path(str(s.session_path) + ".session").exists():
+        # без сессии Pyrogram спросил бы номер телефона в консоли и завис бы в скрытом окне автозапуска
+        log.error("Нет сессии Telegram. Запусти start_agent.bat --login (код из Telegram и пароль 2FA)")
+        return 3
     db = await Database(s.db_path).open()
     tg = PyrogramTransport(s.tg_api_id, s.tg_api_hash, s.tg_phone, s.owner_id, s.data_dir)
     source = MT5Source(s.mt5_path)
     stt, tts = build_stt_tts(s)
-    backend = PyTgCallsBackend(tg.app)
+    backend = None
+    if s.voice_enabled:                         # звонки нужны только вместе с голосом
+        from agent.tg.calls import PyTgCallsBackend
+        backend = PyTgCallsBackend(tg.app)
+    else:
+        log.info("голос выключен (VOICE_ENABLED=false): ассистент работает текстом, звонков нет")
     rt = Runtime(s, db, Messenger(tg), source, tts, stt, backend=backend,
                  direct_close_factory=lambda magic: make_direct_closer(source, int(magic)))
 
@@ -180,6 +201,9 @@ async def run_agent(s: Settings) -> int:
                 if not rt.guard.allowed(uid):
                     await rt.guard.stranger(uid, uname)
                     return
+                if rt.stt is None:                        # голос выключен: не качаем файл, просим написать текстом
+                    await rt.on_message(uid, uname, voice_path="", forwarded=fwd)
+                    return
                 path = await tg.download_voice(message, str(f / f"{message.id}.ogg"))
                 await rt.on_message(uid, uname, voice_path=path, forwarded=fwd)
             elif message.text:
@@ -188,10 +212,23 @@ async def run_agent(s: Settings) -> int:
             log.exception("сбой обработки сообщения")
 
     tg.on_private(on_msg)
-    await tg.start()
-    await backend.start()
+    from agent.tg.diagnose import explain_tg_error
+    try:
+        await tg.start()
+    except Exception as e:
+        log.error("Не удалось войти в Telegram: %s", explain_tg_error(e))
+        await db.close()
+        return 3
+    if backend is not None:
+        await backend.start()
     await rt.start()
-    await rt.m.text("▶️ Консильери на связи.")
+    if not await tg.owner_known():
+        log.warning("Аккаунт ассистента ещё не знает владельца: напиши ему любое сообщение со своего аккаунта. "
+                    "Пока ты не написал, ассистент молчит, но слушает.")
+    try:
+        await rt.m.text("▶️ Консильери на связи.")
+    except Exception as e:                      # не писать первым нельзя, но слушать это не мешает
+        log.warning("Приветствие не отправлено: %s", explain_tg_error(e))
     log.info("ассистент запущен")
     try:
         await asyncio.Event().wait()
@@ -206,6 +243,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="agent.main", description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--login", action="store_true")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--no-send", action="store_true", help="в самопроверке не слать тестовое сообщение в Telegram")
     ap.add_argument("--console", action="store_true", help="диалог в терминале без Telegram")
     ap.add_argument("--fake-robot", action="store_true", help="в режиме консоли поднять симулятор робота")
     ap.add_argument("--real-mt5", action="store_true", help="в режиме консоли брать цены из живого MT5")
@@ -216,7 +254,7 @@ def main(argv: list[str] | None = None) -> int:
         if a.login:
             return asyncio.run(run_login(s))
         if a.selftest:
-            return asyncio.run(run_selftest(s))
+            return asyncio.run(run_selftest(s, send_test=not a.no_send))
         if a.console:
             return asyncio.run(run_console(s, a.fake_robot, a.real_mt5))
         return asyncio.run(run_agent(s))

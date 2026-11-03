@@ -201,6 +201,10 @@ class Runtime:
             await self.guard.stranger(user_id, username)
             return []
         conf = 1.0
+        if voice_path is not None and self.stt is None:           # голос выключен флагом VOICE_ENABLED
+            outs = [OutMsg("Голосовые сейчас выключены (VOICE_ENABLED=false в .env). Напиши текстом.")]
+            await self.m.send(outs)
+            return outs
         if voice_path:
             res = await self.stt.transcribe_file(voice_path)
             text, conf = res.text, res.confidence

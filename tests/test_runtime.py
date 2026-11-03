@@ -116,6 +116,15 @@ async def test_unrecognised_voice_asks_to_repeat(rt, tmp_path):
     assert "повтори" in outs[0].text and claude.calls == []
 
 
+async def test_voice_message_when_voice_is_disabled_asks_for_text_and_never_calls_ai(rt):
+    r, tr, claude, ea, _ = rt
+    r.stt = None                                              # VOICE_ENABLED=false
+    outs = await r.on_message(OWNER, "abu", voice_path="")
+    assert "Голосовые сейчас выключены" in outs[0].text and "VOICE_ENABLED" in outs[0].text and claude.calls == []
+    assert [t[0] for t in tr.sent] == ["text"]
+    assert await r.on_message(999, "stranger", voice_path="") == []          # чужому не отвечаем и тут
+
+
 async def test_tradingview_hint_once(rt):
     r, tr, claude, ea, _ = rt
     claude.script = [text_resp("ок"), text_resp("ок")]
