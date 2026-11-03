@@ -22,7 +22,18 @@ rem --- 3. файл .env и ключ моста
 python -m tools.install_helper
 if errorlevel 1 goto :no_env
 
-rem --- 4. виртуальное окружение
+rem --- 4. виртуальное окружение. При повторном запуске проверяем версию Python внутри .venv:
+rem     окружение не на 3.12+ или сломанное удаляем и создаём заново
+python -m tools.install_helper --check-venv
+if errorlevel 1 goto :drop_venv
+goto :venv_make
+
+:drop_venv
+echo Удаляю старое окружение .venv и создам новое ...
+rmdir /s /q ".venv"
+if exist ".venv" goto :venv_locked
+
+:venv_make
 if not exist ".venv\Scripts\python.exe" (
   echo Создаю виртуальное окружение .venv ...
   python -m venv .venv
@@ -77,6 +88,12 @@ goto :fail
 :no_env
 echo.
 echo [ОШИБКА] Не удалось создать файл .env из .env.example. Проверь, что файл .env.example лежит рядом с install.bat.
+goto :fail
+
+:venv_locked
+echo.
+echo [ОШИБКА] Не удалось удалить старое окружение .venv: его, скорее всего, держит работающий ассистент.
+echo   Останови его: schtasks /End /TN Consigliere, закрой процессы python.exe в диспетчере задач и запусти install.bat снова.
 goto :fail
 
 :no_venv

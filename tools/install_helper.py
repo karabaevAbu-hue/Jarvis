@@ -3,6 +3,7 @@
     python -m tools.install_helper                  # .env из .env.example + ключ моста (если пуст)
     python -m tools.install_helper --check          # Python 3.12+, 64 бита, ffmpeg; код 1, если без этого нельзя
     python -m tools.install_helper --voice-enabled  # код 0, если в .env VOICE_ENABLED=true, иначе 1
+    python -m tools.install_helper --check-venv     # код 1, если .venv создан не Python 3.12+ или сломан (его пересоздают)
     python -m tools.install_helper --models         # модель Whisper из STT_MODEL (нужен requirements-voice.txt)
 
 Работает на одной стандартной библиотеке: install.bat вызывает его системным Python до создания venv.
@@ -13,6 +14,7 @@ import re
 import secrets
 import shutil
 import struct
+import subprocess
 import sys
 from pathlib import Path
 from typing import Callable
@@ -98,6 +100,47 @@ def run_check(env_path: Path, out=print, **kw) -> int:
     return 1 if any(level == "FAIL" for level, _ in results) else 0
 
 
+MIN_PYTHON = (3, 12)
+
+
+def venv_python(root: Path = ROOT) -> Path | None:
+    """python внутри .venv: Scripts\\python.exe (Windows) или bin/python (Linux, для тестов)."""
+    for rel in ("Scripts/python.exe", "bin/python"):
+        p = root / ".venv" / rel
+        if p.exists():
+            return p
+    return None
+
+
+def check_venv(root: Path = ROOT, run=subprocess.run) -> tuple[str, str]:
+    """Состояние .venv при повторном запуске install.bat: ('missing' | 'ok' | 'old' | 'broken', пояснение).
+
+    old: окружение создано Python старше 3.12 (например, после замены Python); broken: python внутри не запускается.
+    """
+    if not (root / ".venv").exists():
+        return "missing", ".venv ещё нет, будет создан"
+    py = venv_python(root)
+    if py is None:
+        return "broken", ".venv есть, но python внутри него не найден"
+    try:
+        res = run([str(py), "-c", "import sys; print(sys.version_info[0], sys.version_info[1])"],
+                  capture_output=True, text=True, timeout=60)
+        major, minor = (int(x) for x in res.stdout.split()[:2])
+        if res.returncode != 0:
+            raise ValueError("код выхода %s" % res.returncode)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        return "broken", f"python внутри .venv не запускается ({type(e).__name__}: {e})"
+    if (major, minor) < MIN_PYTHON:
+        return "old", f".venv создан Python {major}.{minor}, нужен {MIN_PYTHON[0]}.{MIN_PYTHON[1]} или новее"
+    return "ok", f".venv на Python {major}.{minor}"
+
+
+def run_check_venv(root: Path = ROOT, out=print, **kw) -> int:
+    state, msg = check_venv(root, **kw)
+    out(f"[{'OK' if state in ('ok', 'missing') else 'WARN'}] {msg}")
+    return 1 if state in ("old", "broken") else 0
+
+
 def download_models() -> None:
     from agent.config import get_settings
     from faster_whisper import WhisperModel
@@ -110,6 +153,8 @@ def download_models() -> None:
 def main() -> int:
     if "--check" in sys.argv:
         return run_check(readonly_env())
+    if "--check-venv" in sys.argv:
+        return run_check_venv()
     if "--voice-enabled" in sys.argv:
         return 0 if voice_enabled(readonly_env()) else 1
     if "--models" in sys.argv:

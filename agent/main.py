@@ -14,6 +14,7 @@ import logging.handlers
 import sys
 from pathlib import Path
 
+from agent import exitcodes
 from agent.config import Settings, get_settings
 from agent.runtime import Runtime, find_robot
 
@@ -121,7 +122,7 @@ async def run_login(s: Settings) -> int:
     from agent.tg.client import PyrogramTransport
     if not (s.tg_api_id and s.tg_api_hash):
         print("Заполни TG_API_ID и TG_API_HASH в .env (my.telegram.org → API development tools).")
-        return 2
+        return exitcodes.NO_SETTINGS
     tg = PyrogramTransport(s.tg_api_id, s.tg_api_hash, s.tg_phone, s.owner_id, s.data_dir)
     await tg.start()                      # спросит код из Telegram и пароль 2FA
     me = await tg.app.get_me()
@@ -172,11 +173,11 @@ async def run_agent(s: Settings) -> int:
         log.warning("настройка: %s", p)
     if not (s.tg_api_id and s.tg_api_hash and s.owner_id):
         log.error("Нужны TG_API_ID, TG_API_HASH, OWNER_ID в .env")
-        return 2
+        return exitcodes.NO_SETTINGS
     if not Path(str(s.session_path) + ".session").exists():
         # без сессии Pyrogram спросил бы номер телефона в консоли и завис бы в скрытом окне автозапуска
         log.error("Нет сессии Telegram. Запусти start_agent.bat --login (код из Telegram и пароль 2FA)")
-        return 3
+        return exitcodes.NO_SESSION
     db = await Database(s.db_path).open()
     tg = PyrogramTransport(s.tg_api_id, s.tg_api_hash, s.tg_phone, s.owner_id, s.data_dir)
     source = MT5Source(s.mt5_path)
@@ -218,7 +219,7 @@ async def run_agent(s: Settings) -> int:
     except Exception as e:
         log.error("Не удалось войти в Telegram: %s", explain_tg_error(e))
         await db.close()
-        return 3
+        return exitcodes.NO_SESSION
     if backend is not None:
         await backend.start()
     await rt.start()
@@ -248,7 +249,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--fake-robot", action="store_true", help="в режиме консоли поднять симулятор робота")
     ap.add_argument("--real-mt5", action="store_true", help="в режиме консоли брать цены из живого MT5")
     a = ap.parse_args(argv)
-    s = get_settings()
+    try:
+        s = get_settings()
+    except Exception as e:                  # битый .env (например, TG_API_ID=abc): перезапуск не поможет
+        from agent.config import ROOT
+        setup_logging(str(ROOT / "data"))
+        log.error("Ошибка в настройках .env, ассистент не запущен: %s", e)
+        return exitcodes.NO_SETTINGS
     setup_logging(s.data_dir)
     try:
         if a.login:

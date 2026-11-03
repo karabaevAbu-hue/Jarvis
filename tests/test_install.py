@@ -165,3 +165,93 @@ def test_deploy_guide_follows_the_requested_order_and_names_real_things():
         if key.startswith(("TG_", "OWNER", "ANTHROPIC", "BRIDGE", "VOICE", "STT", "SYMBOL", "MT5", "DAILY")):
             assert f"{key}=" in example, f"{key} из инструкции нет в .env.example"
     assert (ROOT / "requirements-voice.txt").exists() and "--no-send" in doc
+
+
+# ---------------------------------------------------------------- повторный install.bat: проверка версии Python внутри .venv
+def _fake_run(stdout="", code=0):
+    class R:
+        returncode, stderr = code, ""
+    R.stdout = stdout
+    return lambda *a, **k: R()
+
+
+def _venv_with_python(root: Path) -> Path:
+    py = root / ".venv" / "bin" / "python"
+    py.parent.mkdir(parents=True)
+    py.write_text("заглушка", encoding="utf-8")
+    return py
+
+
+def test_check_venv_missing_is_fine_and_nothing_to_recreate(tmp_path):
+    assert ih.check_venv(tmp_path)[0] == "missing" and ih.run_check_venv(tmp_path, out=lambda s: None) == 0
+
+
+def test_check_venv_accepts_3_12_and_newer_and_recreates_older_or_broken(tmp_path):
+    _venv_with_python(tmp_path)
+    assert ih.check_venv(tmp_path, run=_fake_run("3 12\n"))[0] == "ok"
+    assert ih.check_venv(tmp_path, run=_fake_run("3 13\n"))[0] == "ok"
+    state, msg = ih.check_venv(tmp_path, run=_fake_run("3 11\n"))
+    assert state == "old" and "3.11" in msg and "3.12" in msg
+    assert ih.check_venv(tmp_path, run=_fake_run("3 9\n"))[0] == "old"
+    assert ih.check_venv(tmp_path, run=_fake_run("", code=1))[0] == "broken"            # python внутри падает
+    assert ih.check_venv(tmp_path, run=_fake_run("мусор"))[0] == "broken"
+    codes = [ih.run_check_venv(tmp_path, out=lambda s: None, run=_fake_run(v)) for v in ("3 12\n", "3 11\n", "")]
+    assert codes == [0, 1, 1]                                                           # код 1 = install.bat пересоздаёт .venv
+
+
+def test_check_venv_on_a_real_venv_and_on_an_unrunnable_python(tmp_path):
+    import subprocess as sp
+    import sys
+    sp.run([sys.executable, "-m", "venv", "--without-pip", str(tmp_path / ".venv")], check=True, capture_output=True)
+    state, msg = ih.check_venv(tmp_path)
+    assert state == "ok" and msg.startswith(".venv на Python 3.")                       # настоящий python внутри venv
+    py = ih.venv_python(tmp_path)
+    assert py is not None
+    py.unlink()
+    py.write_text("не программа", encoding="utf-8")                                     # файл есть, запустить нельзя
+    state, msg = ih.check_venv(tmp_path)
+    assert state == "broken" and "не запускается" in msg
+
+
+def test_install_bat_recreates_an_old_venv_and_explains_a_locked_one():
+    bat = (ROOT / "install.bat").read_text(encoding="utf-8")
+    assert bat.index("--check-venv") < bat.index("python -m venv .venv")                # проверка до создания
+    assert re.search(r"--check-venv\s*\nif errorlevel 1 goto :drop_venv\ngoto :venv_make", bat)
+    drop = bat[bat.index("\n:drop_venv\n"):bat.index("\n:venv_make\n")]               # метки в начале строки, не «goto :...»
+    assert 'rmdir /s /q ".venv"' in drop and 'if exist ".venv" goto :venv_locked' in drop
+    locked = bat[bat.index("\n:venv_locked\n"):bat.index("\n:no_venv\n")]
+    assert "schtasks /End /TN Consigliere" in locked and "goto :fail" in locked          # занятое окружение: понятный выход, не молчание
+
+
+# ---------------------------------------------------------------- предупреждения в документах
+BOLD_EQUITY = "**`InpEquityStopUSD` по умолчанию 0 = защита выключена. Для счёта $100 ставь, например, 60.**"
+
+
+def test_equity_stop_default_is_a_bold_warning_in_both_docs():
+    for name in ("mt5/README.md", "docs/DEPLOY_SERVER.md"):
+        doc = (ROOT / name).read_text(encoding="utf-8")
+        assert BOLD_EQUITY in doc, name
+    robot = (ROOT / "mt5" / "MrCasino.mq5").read_text(encoding="utf-8")
+    assert re.search(r"^input\s+double\s+InpEquityStopUSD\s*=\s*0\.0;", robot, re.M)              # документ не врёт про умолчание
+
+
+def test_deploy_guide_describes_the_restart_policy_of_the_autostart():
+    from agent.supervisor import DELAYS
+    doc = (ROOT / "docs" / "DEPLOY_SERVER.md").read_text(encoding="utf-8")
+    assert DELAYS == (10, 30, 60, 300)
+    assert "10 секунд, 30 секунд, 60 секунд, потом каждые 5 минут" in doc
+    assert "коде выхода 2" in doc and "или 3 (нет сессии Telegram)" in doc and "schtasks /Run /TN Consigliere" in doc
+    assert "schtasks /End /TN Consigliere" in doc and "assistant.log" in doc
+    mt5 = (ROOT / "mt5" / "README.md").read_text(encoding="utf-8").lower()
+    assert "на 2% выше порога" in mt5 and "inpminslpt" in mt5 and "не чаще раза в минуту" in mt5
+
+
+def test_requirements_dev_holds_pytest_and_the_server_does_not_get_it():
+    dev = _reqs("requirements-dev.txt")
+    assert "-r requirements.txt" in dev and re.search(r"^pytest>=", dev, re.M) and re.search(r"^pytest-asyncio>=", dev, re.M)
+    for name in ("requirements.txt", "requirements-windows.txt", "requirements-voice.txt"):
+        assert "pytest" not in _reqs(name), f"{name}: pytest не нужен на сервере"
+    wf = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
+    assert "pip install -r requirements-dev.txt" in wf and "pip install -r requirements.txt" not in wf
+    assert "requirements-dev.txt" in (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "pytest" not in (ROOT / "install.bat").read_text(encoding="utf-8")

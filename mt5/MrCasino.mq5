@@ -337,6 +337,9 @@ string     g_lastMorningDay = "";
 string     g_lastReportDay  = "";
 int        g_noSlTries    = 0;
 ulong      g_eqCloseMs    = 0;          // v3.4: когда последний раз пытались закрыть позицию по стопу эквити
+bool       g_eqTripped    = false;      // v3.4: жёсткий стоп по эквити сработал и ещё не снят (гистерезис +2%)
+ulong      g_closeFailMs  = 0;          // v3.4: когда последний раз писали «Закрытие не удалось» (не чаще раза в минуту)
+int        g_closeFailN   = 0;          // v3.4: неудачных закрытий подряд
 datetime   g_noSlLast     = 0;
 bool       g_biasInit     = false;
 bool       g_zoneCreating = false;   // зона создаётся: zone_invalid не шлём
@@ -2397,16 +2400,27 @@ double DailyRiskLeft()
    return DayStartBalance() * g_set.dailyRiskPct / 100.0 - MathMax(0.0, -g_day.usd);
   }
 
-// Жёсткий стоп по эквити [v3.4]: эквити ниже InpEquityStopUSD
+// Жёсткий стоп по эквити [v3.4]: эквити ниже InpEquityStopUSD. Гистерезис: после срабатывания стоп держится, пока
+// эквити не вернётся на 2% выше порога, иначе эквити, прыгающее вокруг порога, открывало бы и закрывало тревогу.
+#define EQ_STOP_HYST   1.02
+#define EQ_STOP_REASON "жёсткий стоп по эквити"      // g_pauseReason начинается с этого текста
+
 bool EquityBelowStop()
   {
-   return InpEquityStopUSD > 0 && AccountInfoDouble(ACCOUNT_EQUITY) < InpEquityStopUSD;
+   if(InpEquityStopUSD <= 0) return false;
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   return eq < InpEquityStopUSD || (g_eqTripped && eq < InpEquityStopUSD * EQ_STOP_HYST);
   }
 
 string EquityStopText()
   {
-   return StringFormat("эквити %.2f %s ниже жёсткого стопа %.2f", AccountInfoDouble(ACCOUNT_EQUITY),
-                       AccountInfoString(ACCOUNT_CURRENCY), InpEquityStopUSD);
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   string cur = AccountInfoString(ACCOUNT_CURRENCY);
+   if(eq < InpEquityStopUSD)
+      return StringFormat("эквити %.2f %s ниже жёсткого стопа %.2f", eq, cur, InpEquityStopUSD);
+   // зона гистерезиса: эквити уже выше порога, но стоп ещё держится
+   return StringFormat("эквити %.2f %s ещё не вернулось выше жёсткого стопа %.2f на 2%% (нужно от %.2f)", eq, cur, InpEquityStopUSD,
+                       InpEquityStopUSD * EQ_STOP_HYST);
   }
 
 // Знаков после запятой у шага лота: 0.01 -> 2, 0.001 -> 3, 0.1 -> 1, 1 -> 0
@@ -2940,35 +2954,52 @@ void TryEntry()
 void ClosePosNow(ulong tk, string tag)
   {
    g_exitTag = tag;
-   if(!g_trade.PositionClose(tk))
-      Print("Закрытие не удалось: ", g_trade.ResultRetcode(), " ", g_trade.ResultRetcodeDescription());
+   if(g_trade.PositionClose(tk))
+     {
+      g_closeFailN = 0;
+      return;
+     }
+   g_closeFailN++;
+   // при стопе по эквити закрытие повторяется раз в секунду, а в журнал пишем не чаще раза в минуту
+   if(g_closeFailMs == 0 || GetTickCount64() - g_closeFailMs >= 60000)
+     {
+      g_closeFailMs = GetTickCount64();
+      Print("Закрытие не удалось: ", g_trade.ResultRetcode(), " ", g_trade.ResultRetcodeDescription(),
+            " (неудачных попыток подряд: ", g_closeFailN, ")");
+     }
   }
 
 // Жёсткий стоп по эквити [v3.4]: закрыть позицию, поставить паузу, поднять критичную тревогу.
-// Вызывается на каждом тике и раз в секунду из таймера. Пауза сама не снимается: resume отказывает, пока эквити ниже порога.
+// Вызывается на каждом тике и раз в секунду из таймера. Пауза сама не снимается: resume отказывает, пока стоп держится.
+// Гистерезис: сработал при эквити ниже порога, снимается при эквити от порога +2%.
 void CheckEquityStop()
   {
    if(InpEquityStopUSD <= 0) return;
-   if(!EquityBelowStop())
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(eq < InpEquityStopUSD) g_eqTripped = true;
+   else if(eq >= InpEquityStopUSD * EQ_STOP_HYST) g_eqTripped = false;
+   if(!g_eqTripped)
      {
       if(AlertIsOn("equity_stop"))
          AlertSet("equity_stop", false, "critical",
-                  StringFormat("Эквити %.2f снова выше жёсткого стопа %.2f. Робот остаётся на паузе до команды resume.",
-                               AccountInfoDouble(ACCOUNT_EQUITY), InpEquityStopUSD));
+                  StringFormat("Эквити %.2f вернулось выше жёсткого стопа %.2f на 2%%. Робот остаётся на паузе до команды resume.",
+                               eq, InpEquityStopUSD));
       return;
      }
    string why = EquityStopText();
-   if(!g_set.paused)
+   // при каждом срабатывании причина паузы - стоп по эквити, даже если пауза уже была (например, из Telegram)
+   if(!g_set.paused || StringFind(g_pauseReason, EQ_STOP_REASON) != 0 || !AlertIsOn("equity_stop"))
      {
+      bool was = g_set.paused;
       g_set.paused = true;
-      g_pauseReason = "жёсткий стоп по эквити: " + why;
+      g_pauseReason = EQ_STOP_REASON + ": " + why;
       SaveSettings();
-      Lg(0, "ЖЁСТКИЙ СТОП ПО ЭКВИТИ: " + why + ". Позиция закрывается, робот на паузе.");
+      Lg(0, "ЖЁСТКИЙ СТОП ПО ЭКВИТИ: " + why + ". Позиция закрывается, робот на паузе" + (was ? " (причина прежней паузы заменена)." : "."));
      }
    if(!AlertIsOn("equity_stop"))                // текст собираем один раз, а не на каждом тике
       AlertSet("equity_stop", true, "critical",
                "Жёсткий стоп по эквити: " + why + ". Позиция закрывается, робот поставлен на паузу, новые входы остановлены. "
-               "Проверь счёт: пауза снимется командой resume только когда эквити поднимется выше порога.");
+               "Проверь счёт: пауза снимется командой resume, когда эквити поднимется не ниже порога +2%.");
    ulong tk; long id; int d; double vol, op, sl, tp;
    if(FindPos(tk, id, d, vol, op, sl, tp) && GetTickCount64() - g_eqCloseMs >= 1000)   // повтор раз в секунду, пока не закрыта
      {
@@ -3145,14 +3176,16 @@ void ManagePosition()
      {
       double step = SymbolInfoDouble(g_sym, SYMBOL_VOLUME_STEP);
       double minv = SymbolInfoDouble(g_sym, SYMBOL_VOLUME_MIN);
-      double cv = MathFloor(vol / 2.0 / step + 1e-9) * step;
+      double cv = NormLot(vol / 2.0);                  // округлённый по шагу символа объём: его и закрываем, его и пишем в событие
+      int ld = LotDigits(step);
       if(cv >= minv && vol - cv >= minv - 1e-12)
         {
-         if(g_trade.PositionClosePartial(tk, NormLot(cv)))
+         if(g_trade.PositionClosePartial(tk, cv))
            {
             g_partDone = true;
-            Emit("trade_partial", 0, "info", JI("ticket", g_pId) + "," + JN("closed_lot", cv, 2) + "," + JN("left_lot", vol - cv, 2),
-                 StringFormat("50%% позиции закрыто на первой LAL: %.2f лота, осталось %.2f", cv, vol - cv), -1);
+            double left = NormalizeDouble(vol - cv, ld);
+            Emit("trade_partial", 0, "info", JI("ticket", g_pId) + "," + JN("closed_lot", cv, ld) + "," + JN("left_lot", left, ld),
+                 StringFormat("50%% позиции закрыто на первой LAL: %s лота, осталось %s", DoubleToString(cv, ld), DoubleToString(left, ld)), -1);
            }
         }
       else
@@ -3489,6 +3522,7 @@ bool ExecOpen(const string &k[], const string &v[], string &msg)
    int d = side == "BUY" ? 1 : -1;
    double dist = slPts;
    if(dist > InpMaxSL) { msg = StringFormat("стоп %.1f больше максимального %.1f (InpMaxSLPt), как и у автоматического входа", dist, InpMaxSL); return false; }
+   if(dist < InpMinSL) { msg = StringFormat("стоп %.1f меньше минимального %.1f (InpMinSLPt), как и у автоматического входа", dist, InpMinSL); return false; }
    if(dist < MinStopDist()) { msg = StringFormat("стоп %.1f меньше стоп-уровня брокера", dist); return false; }
    double rr = hRr ? rrArg : g_set.rr;
    double entry = d > 0 ? ask : bid;
@@ -3847,6 +3881,9 @@ int OnInit()
                       InpBEFrac, g_set.maxTrades, g_set.weak ? "вкл" : "выкл (добор с " + InpQuotaFrom + ")"));
    Print(StringFormat("Риск: %.2f%% на сделку, в день до %.1f%% баланса%s", TradeRiskPct(EffectiveRiskMode()), g_set.dailyRiskPct,
                       EffectiveRiskMode() == RISK_FIXED ? " (режим FIXED: лот " + DoubleToString(InpFixedLot, 2) + ", дневной лимит действует)" : ""));
+   // перезапуск робота в зоне гистерезиса: пауза от стопа по эквити ещё держится
+   g_eqTripped = InpEquityStopUSD > 0 && g_set.paused && StringFind(g_pauseReason, EQ_STOP_REASON) == 0 &&
+                 AccountInfoDouble(ACCOUNT_EQUITY) < InpEquityStopUSD * EQ_STOP_HYST;
    if(InpEquityStopUSD > 0)
       Print(StringFormat("Жёсткий стоп по эквити: %.2f %s (сейчас эквити %.2f)", InpEquityStopUSD, AccountInfoString(ACCOUNT_CURRENCY),
                          AccountInfoDouble(ACCOUNT_EQUITY)));

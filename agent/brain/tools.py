@@ -106,7 +106,7 @@ ACTION_TOOLS = [
      "input_schema": _obj({"on": {"type": "boolean"}}, ["on"])},
     {"name": "set_side", "description": "Предложить разрешённые стороны сделок.",
      "input_schema": _obj({"buy": {"type": "boolean"}, "sell": {"type": "boolean"}}, ["buy", "sell"])},
-    {"name": "manual_open", "description": "Предложить ручную сделку (стоп обязателен).",
+    {"name": "manual_open", "description": "Предложить ручную сделку (стоп обязателен). Робот сам отклонит стоп вне своих границ: по умолчанию от 5 до 15 пунктов (InpMinSLPt, InpMaxSLPt).",
      "input_schema": _obj({"side": {"type": "string", "enum": ["BUY", "SELL"]}, "sl_pts": {"type": "number"},
                            "risk": {"type": "number"}, "rr": {"type": "number"}}, ["side", "sl_pts"])},
     {"name": "reset_settings", "description": "Предложить вернуть настройки к значениям входных параметров.",

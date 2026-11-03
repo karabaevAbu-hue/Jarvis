@@ -6,7 +6,7 @@
 
 ## Что готово и что проверено
 
-Честная сводка. «Проверено» значит, что есть автотесты, которые проходят (369 тестов, `pytest`; в GitHub Actions идут 366, ещё 3 запускаются только там, где стоят pyrogram и py-tgcalls).
+Честная сводка. «Проверено» значит, что есть автотесты, которые проходят (396 тестов, `pytest`; в GitHub Actions идут 393, ещё 3 запускаются только там, где стоят pyrogram и py-tgcalls).
 
 Сервер: Windows Server 2022, 4 ГБ, Timeweb, символ `GOLD#`, сначала демо. Пошаговая установка: **`docs/DEPLOY_SERVER.md`**.
 
@@ -20,7 +20,7 @@
 | 6. Управление | Готово и проверено: «да» в коде, срок 60 с, одноразовость, обход не работает, журнал действий |
 | 7. Голосовые | Логика готова и проверена (конец фразы, озвучка, кэш, ffmpeg), включается флагом `VOICE_ENABLED=true`. Whisper и edge-tts на реальных данных в облаке не гонялись |
 | 8. Звонки | Диалог и повторы тревоги проверены на двойнике. Импорты и сигнатуры `agent/tg/calls.py` сверены с настоящим `py-tgcalls` 3.0.0. **Живой звонок не проверялся**; без голоса звонков нет |
-| 9. Сторож, расписание, отчёты, установка | Готово и проверено; `install.bat` (проверяет Python 3.12 и ffmpeg, не закрывается молча) и автозапуск написаны, **на Windows не запускались** |
+| 9. Сторож, расписание, отчёты, установка | Готово и проверено; `install.bat` (проверяет Python 3.12 и ffmpeg, пересоздаёт старый `.venv`, не закрывается молча) и автозапуск написаны, **на Windows не запускались**. Автозапуск через присмотрщик `agent/supervisor.py`: пауза между перезапусками 10 с → 30 с → 60 с → 5 мин, при коде выхода 2 (нет настроек) и 3 (нет сессии Telegram) перезапуски прекращаются, причина в лог и окно на экране (политика проверена тестами и с настоящим процессом ассистента, окно `MessageBoxW` на Windows не проверялось) |
 | Самопроверка `--selftest` | Telegram (вход, владелец, отправка), мост (папка, статус, ping) и MT5 проверяются по отдельности с причиной по-русски. Проверена на двойниках и на настоящем клиенте pyrogram (битая сессия, нет связи). **Живой вход в Telegram не проверялся** |
 | Приёмка на демо (раздел 19) | Не проводилась: нужны Windows, MT5, робот v3.3, Telegram |
 
@@ -28,7 +28,7 @@
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt                 # зависимости и pytest (на сервере нужен только requirements-windows.txt)
 python -m pytest                                    # все тесты
 python -m agent.analysis zones --fake --png z.png   # зоны на синтетических свечах + график
 python -m agent.main --console --fake-robot         # диалог с ассистентом в терминале
@@ -58,6 +58,7 @@ python -m agent.main --console --fake-robot         # диалог с ассис
 mt5/                 MrCasino.mq5 (v3.4), MrCasinoExport.mq5 (выгрузка для сверки), archive/ (v3.2, v3.3)
 agent/
   main.py            запуск: --login, --selftest, --console, обычный
+  supervisor.py      присмотр для автозапуска: пауза перезапусков, остановка при кодах 2 и 3 (exitcodes.py)
   runtime.py         сборка всех частей в одну систему
   config.py          .env и проверка
   notifier.py        события робота -> сообщения, тревоги, звонок, аварийная пауза
@@ -78,8 +79,8 @@ agent/
   bridge/            протокол, события с курсором, команды, статус, trades.csv, прямое закрытие
   storage/db.py      SQLite
 tools/               fake_ea.py (симулятор робота), fake_mt5.py (свечи), parity.py (сверка зон), mql_lint.py (линтер MQL5: `python -m tools.mql_lint`), call_prototype.py, install_helper.py
-requirements*.txt    requirements.txt (общее), -windows.txt (сервер, без голоса), -voice.txt (torch, Whisper, py-tgcalls 3.x)
-tests/               369 тестов
+requirements*.txt    requirements.txt (общее), -windows.txt (сервер, без голоса), -voice.txt (torch, Whisper, py-tgcalls 3.x), -dev.txt (pytest, для разработки и CI)
+tests/               396 тестов
 docs/                ТЗ, стратегия, книга, DEPLOY_SERVER.md (установка на сервер), engine_vs_robot.md (порт и сверка)
 ```
 
@@ -97,7 +98,7 @@ docs/                ТЗ, стратегия, книга, DEPLOY_SERVER.md (у�
 ## Что нужно от Абу
 
 1. **F7 для `mt5/MrCasino.mq5`** в MetaEditor. Если будут ошибки компиляции, прислать текст: в облаке MQL5 не компилируется, я проверял только линтером и тестами.
-   Затем задать `InpEquityStopUSD` (по умолчанию 0 = выключен) и проверить на демо стоп по эквити, ручной вход выше `InpMaxSLPt` и спред `GOLD#` (чек-лист в `mt5/README.md`).
+   Затем задать `InpEquityStopUSD` (**по умолчанию 0 = защита выключена**; для демо $100 например 60) и проверить на демо стоп по эквити, ручной вход выше `InpMaxSLPt` и спред `GOLD#` (чек-лист в `mt5/README.md`).
 2. **Сверка зон** (две минуты): `mt5/MrCasinoExport.mq5` на график золота, затем `python -m tools.parity --dir ...`. Подробности в `docs/engine_vs_robot.md`.
 3. Живой Telegram: `--login`, потом `--selftest` (три строки Telegram должны быть ✔). Звонок (`tools/call_prototype.py`) нужен, только если включаешь голос.
 3а. Решить про OB на Weekly и D1: по ТЗ они допустимы, у робота их нет (см. `docs/engine_vs_robot.md`).

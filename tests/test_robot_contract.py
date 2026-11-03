@@ -229,15 +229,25 @@ def test_v34_changes_exactly_the_functions_that_were_asked_for():
     assert set(old) - set(new) == set(), "функции v3.3 пропали"
     assert set(new) - set(old) == {"CheckEquityStop", "EquityBelowStop", "EquityStopText", "LotDigits", "NormLot", "SigInit"}
     changed = {n for n in old if old[n] != new[n]}
-    assert changed == {"BridgeLine", "CalcLot", "DrawPanel", "EvalZone", "ExecCmd", "ExecOpen", "GlobalBlock", "ManagePosition",
-                       "OnInit", "OnTick", "OnTimer", "Skip", "TryEntry", "WriteStatus"}
+    assert changed == {"BridgeLine", "CalcLot", "ClosePosNow", "DrawPanel", "EvalZone", "ExecCmd", "ExecOpen", "GlobalBlock",
+                       "ManagePosition", "OnInit", "OnTick", "OnTimer", "Skip", "TryEntry", "WriteStatus"}
     # решения о входе: правки только такие
     assert _changed_lines(old["TryEntry"], new["TryEntry"]) == {"-bs.ok = false;", "+SigInit(bs);", "+SigInit(s);"}
     assert _changed_lines(old["CalcLot"], new["CalcLot"]) == {
         "-lot = NormalizeDouble(lot, 2);", "+lot = NormLot(lot);",
         '+if(lot <= 0) { why = "лот после округления по шагу символа меньше минимального"; return 0; }'}
-    assert _changed_lines(old["ManagePosition"], new["ManagePosition"]) == {
-        "-if(g_trade.PositionClosePartial(tk, NormalizeDouble(cv, 2)))", "+if(g_trade.PositionClosePartial(tk, NormLot(cv)))"}
+    # ManagePosition: правка только в блоке частичного закрытия (объём по шагу символа и в событии); сопровождение не тронуто
+    mp = _changed_lines(old["ManagePosition"], new["ManagePosition"])
+    assert mp == {
+        "-double cv = MathFloor(vol / 2.0 / step + 1e-9) * step;",
+        "+double cv = NormLot(vol / 2.0);                  // округлённый по шагу символа объём: его и закрываем, его и пишем в событие",
+        "+int ld = LotDigits(step);",
+        "-if(g_trade.PositionClosePartial(tk, NormalizeDouble(cv, 2)))", "+if(g_trade.PositionClosePartial(tk, cv))",
+        '-Emit("trade_partial", 0, "info", JI("ticket", g_pId) + "," + JN("closed_lot", cv, 2) + "," + JN("left_lot", vol - cv, 2),',
+        '-StringFormat("50%% позиции закрыто на первой LAL: %.2f лота, осталось %.2f", cv, vol - cv), -1);',
+        "+double left = NormalizeDouble(vol - cv, ld);",
+        '+Emit("trade_partial", 0, "info", JI("ticket", g_pId) + "," + JN("closed_lot", cv, ld) + "," + JN("left_lot", left, ld),',
+        '+StringFormat("50%% позиции закрыто на первой LAL: %s лота, осталось %s", DoubleToString(cv, ld), DoubleToString(left, ld)), -1);'}
     assert _changed_lines(old["OnTick"], new["OnTick"]) == {"+CheckEquityStop();"}
     gb = _changed_lines(old["GlobalBlock"], new["GlobalBlock"])
     assert gb == {'+if(EquityBelowStop()) return "жёсткий стоп по эквити: " + EquityStopText();',
@@ -299,15 +309,54 @@ def test_equity_stop_closes_pauses_and_alerts():
     assert 'ClosePosNow(tk, "EQSTOP")' in cs and "g_set.paused = true;" in cs and "SaveSettings();" in cs
     assert re.search(r'AlertSet\("equity_stop", true, "critical"', cs)
     assert "GetTickCount64() - g_eqCloseMs >= 1000" in cs                 # повтор закрытия, пока позиция не закрыта
-    assert fn_body("EquityBelowStop").strip() == "return InpEquityStopUSD > 0 && AccountInfoDouble(ACCOUNT_EQUITY) < InpEquityStopUSD;"
     tick, timer = fn_body("OnTick"), fn_body("OnTimer")
     assert tick.index("CheckEquityStop();") < tick.index("ManagePosition();")     # стоп раньше сопровождения
     assert "CheckEquityStop();" in timer                                           # и раз в секунду без тиков
     assert "EquityBelowStop()" in fn_body("GlobalBlock") and "EquityBelowStop()" in fn_body("ExecOpen")
     ex = fn_body("ExecCmd")
-    assert re.search(r'cmd == "resume"\)\s*\n\s*\{\n\s*if\(EquityBelowStop\(\)\)', ex)       # resume не снимает паузу ниже порога
+    assert re.search(r'cmd == "resume"\)\s*\n\s*\{\n\s*if\(EquityBelowStop\(\)\)', ex)       # resume не снимает паузу, пока стоп держится
     assert 'EQSTOP' in SRC and "equity_stop_usd" in fn_body("WriteStatus")
     assert "⚠️ Стоп по эквити выключен" in fn_body("BridgeLine") and "жёсткий стоп по эквити выключен" in fn_body("OnInit")
+
+
+def test_equity_stop_hysteresis_clears_the_alert_only_2_percent_above_the_threshold():
+    assert re.search(r"#define EQ_STOP_HYST\s+1\.02\b", SRC)
+    below = fn_body("EquityBelowStop")
+    assert "eq < InpEquityStopUSD || (g_eqTripped && eq < InpEquityStopUSD * EQ_STOP_HYST)" in below
+    cs = fn_body("CheckEquityStop")
+    assert "if(eq < InpEquityStopUSD) g_eqTripped = true;" in cs
+    assert "else if(eq >= InpEquityStopUSD * EQ_STOP_HYST) g_eqTripped = false;" in cs
+    # тревога закрывается только когда стоп снят (после возврата на +2%), а не на пороге
+    off = cs[cs.index("if(!g_eqTripped)"):cs.index("string why = EquityStopText();")]
+    assert 'AlertSet("equity_stop", false' in off and "return;" in off
+    # после перезапуска робота в зоне гистерезиса состояние восстанавливается из паузы с причиной «стоп по эквити»
+    init = fn_body("OnInit")
+    assert "g_eqTripped = InpEquityStopUSD > 0 && g_set.paused && StringFind(g_pauseReason, EQ_STOP_REASON) == 0" in init
+    assert "AccountInfoDouble(ACCOUNT_EQUITY) < InpEquityStopUSD * EQ_STOP_HYST" in init
+    # текст в зоне гистерезиса честный: эквити уже выше порога, но стоп держится
+    txt = fn_body("EquityStopText")
+    assert "ниже жёсткого стопа" in txt and "ещё не вернулось выше жёсткого стопа" in txt and "EQ_STOP_HYST" in txt
+
+
+def test_equity_stop_always_sets_its_own_pause_reason_even_over_an_older_pause():
+    assert '#define EQ_STOP_REASON "жёсткий стоп по эквити"' in SRC
+    cs = fn_body("CheckEquityStop")
+    cond = re.search(r"if\((!g_set\.paused[^\n]*)\)\s*\n\s*\{", cs).group(1)
+    # пауза не наша (ни паузы, ни причины «стоп по эквити») или это новое срабатывание: причина перезаписывается
+    assert cond == '!g_set.paused || StringFind(g_pauseReason, EQ_STOP_REASON) != 0 || !AlertIsOn("equity_stop")'
+    assert "g_pauseReason = EQ_STOP_REASON" in cs and "причина прежней паузы заменена" in cs
+    assert cs.index("g_pauseReason = EQ_STOP_REASON") < cs.index('AlertSet("equity_stop", true')    # условие считается до открытия тревоги
+    # причину пишем один раз на срабатывание, а не на каждом тике: SaveSettings() не дёргается постоянно
+    assert cs.count("SaveSettings();") == 1
+
+
+def test_close_failed_message_is_written_at_most_once_a_minute():
+    cp = fn_body("ClosePosNow")
+    assert "g_closeFailMs == 0 || GetTickCount64() - g_closeFailMs >= 60000" in cp
+    assert cp.count("Print(") == 1 and "Закрытие не удалось" in cp
+    assert cp.index("g_closeFailMs = GetTickCount64();") < cp.index('Print("Закрытие не удалось')
+    assert "g_closeFailN = 0;" in cp and "g_closeFailN++;" in cp           # счётчик неудач подряд сбрасывается успехом
+    assert 'Print("Закрытие не удалось' not in SRC.replace(cp, "")         # других мест с этим сообщением нет
 
 
 def test_equity_stop_vocabulary_is_known_to_the_assistant():
@@ -317,10 +366,12 @@ def test_equity_stop_vocabulary_is_known_to_the_assistant():
     assert "equity_stop" not in EMERGENCY_PAUSE_KEYS                    # робот паузу уже поставил сам
 
 
-def test_manual_open_checks_max_sl_like_the_automatic_entry():
+def test_manual_open_checks_min_and_max_sl_like_the_automatic_entry():
     op = fn_body("ExecOpen")
     assert "dist > InpMaxSL" in op and "InpMaxSLPt" in op
-    assert op.index("dist > InpMaxSL") < op.index("CalcLot(")             # до расчёта лота и ордера
+    assert "dist < InpMinSL" in op and "InpMinSLPt" in op                  # v3.4: и минимальный стоп
+    assert op.index("dist > InpMaxSL") < op.index("CalcLot(") and op.index("dist < InpMinSL") < op.index("CalcLot(")   # до расчёта лота и ордера
+    assert "InpMinSL" in fn_body("TryEntry")                               # у автоматического входа тот же нижний предел
     auto = fn_body("TryEntry")
     assert "dist > InpMaxSL" in auto                                       # то же условие у автоматического входа
     assert f"slPts > {OPEN_SL_MAX_PTS}" in op                              # общий предел 50 pt остаётся
@@ -332,7 +383,12 @@ def test_lot_follows_symbol_volume_step():
         assert token in nl, token
     code = mql_lint.strip(SRC)[0]                                          # без комментариев: в них эта строка объясняется
     assert not re.search(r"NormalizeDouble\((lot|cv),\s*2\)", code)            # жёсткие 2 знака запрещены, нужны знаки шага
-    assert "NormLot(lot)" in fn_body("CalcLot") and "NormLot(cv)" in fn_body("ManagePosition")
+    assert "NormLot(lot)" in fn_body("CalcLot")
+    mp = fn_body("ManagePosition")
+    assert "double cv = NormLot(vol / 2.0);" in mp                         # округлённый объём один раз
+    assert "PositionClosePartial(tk, cv)" in mp                            # его и закрываем
+    assert 'JN("closed_lot", cv, ld)' in mp and 'JN("left_lot", left, ld)' in mp and "double left = NormalizeDouble(vol - cv, ld);" in mp
+    assert 'JN("closed_lot", cv, 2)' not in mp                             # ни исходного 50%, ни фиксированных 2 знаков
     assert "step * MathPow(10.0, n)" in fn_body("LotDigits")
 
 
