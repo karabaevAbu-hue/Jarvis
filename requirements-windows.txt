@@ -2,4 +2,4 @@
 -r requirements.txt
 MetaTrader5>=5.0.45          # цены и счёт из запущенного терминала
 pyrofork>=2.3                # Telegram-клиент (Pyrogram-форк); см. agent/tg/client.py
-tgcrypto>=1.2                # ускорение шифрования Telegram
+tgcrypto-pyrofork>=1.2.6      # ускорение шифрования Telegram (тот же модуль tgcrypto). Не оригинальный tgcrypto: у него нет колёс под Windows/Python 3.12, pip собирал бы из исходников и падал без компилятора C++

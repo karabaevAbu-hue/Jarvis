@@ -47,6 +47,8 @@ def test_requirements_cover_fresh_install_and_voice_is_separate():
     for heavy in ("faster-whisper", "silero-vad", "torch", "tgcalls"):
         assert heavy not in win, f"{heavy} не должен ставиться без голоса"
     assert "MetaTrader5" in win and "pyrofork" in win and "-r requirements.txt" in win
+    # у оригинального tgcrypto нет колёс под Windows/Python 3.12: pip собирал бы его из исходников и падал без C++ (проверено по PyPI)
+    assert re.search(r"^tgcrypto-pyrofork>=", win, re.M) and not re.search(r"^tgcrypto\s*[<>=]", win, re.M)
     assert re.search(r"^py-tgcalls>=3\.0,<4", voice, re.M)                  # код звонков написан под 3.x
     assert "faster-whisper" in voice and "silero-vad" in voice and "-r requirements-windows.txt" in voice
 
