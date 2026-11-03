@@ -186,6 +186,7 @@ consigliere-trading/
 | `algo_off` | `TERMINAL_TRADE_ALLOWED` или `MQL_TRADE_ALLOWED` = false | critical |
 | `no_sl` | позиция робота без стопа; робот пытается поставить стоп заново | critical |
 | `orders_rejected` | 3 отказа подряд → автопауза; одиночный отказ — `order_rejected`, warning | critical |
+| `equity_stop` | v3.4: эквити ниже `InpEquityStopUSD`: позиция закрыта, робот на паузе; пауза снимается командой `resume` только когда эквити выше порога | critical |
 | `day_dd` | эквити ниже баланса начала дня на `InpAlertDDPct` | warning |
 | `day_limit` | дневной риск исчерпан, робот стоит до завтра | critical |
 | `spread` | спред выше нормы в `InpAlertSpreadX` раз дольше 2 минут при открытой позиции | warning |
@@ -237,7 +238,7 @@ consigliere-trading/
   "ts_utc": "2026-11-02T08:15:10Z",
   "ts_local": "2026-11-02 14:15:10",
   "terminal": {"connected": true, "algo_allowed": true, "ea_trade_allowed": true, "ping_ms": 41},
-  "account": {"login": 12345678, "server": "Exness-MT5Trial", "currency": "USD", "mode": "demo", "balance": 1000.0, "equity": 1004.2, "margin_free": 980.1, "margin_level": 4200.0},
+  "account": {"login": 12345678, "server": "Exness-MT5Trial", "currency": "USD", "mode": "demo", "balance": 1000.0, "equity": 1004.2, "margin_free": 980.1, "margin_level": 4200.0, "equity_stop_usd": 0.0},
   "symbol": {"name": "XAUUSDm", "bid": 2650.12, "ask": 2650.31, "spread": 0.19, "last_tick_utc": "2026-11-02T08:15:09Z", "market_open": true},
   "session": {"open": true, "name": "LONDON", "relaxed": true},
   "paused": false,
@@ -262,7 +263,7 @@ consigliere-trading/
 | `trade_be` | 0 | стоп перенесён в безубыток | нет |
 | `trade_modified` | 0 | стоп или тейк изменены командой | нет |
 | `trade_partial` | 0 | частичное закрытие | нет |
-| `trade_closed` | 0 | выход: TP, SL, BE, EARLY, FRIDAY, MANUAL, OTHER | да |
+| `trade_closed` | 0 | выход: TP, SL, BE, EARLY, FRIDAY, MANUAL, EQSTOP (жёсткий стоп по эквити, v3.4), OTHER | да |
 | `limit_reached` | 0 | лимит сделок, дневного риска, серии стопов или цель дня | нет |
 | `alert` | 0 | раздел 5.8 (начало и конец) | нет |
 | `daily_report` | 0 | `InpReportHM` | да |
@@ -444,7 +445,7 @@ HTF-уровни H4: 2650.20 / 2647.80 / 2645.30 / 2642.00
 
 **Голосовые сообщения:** голосовое Абу → текст (Whisper) → обычный диалог. На голосовое ассистент отвечает голосовым + коротким текстом, на текст — текстом. Это и запасной вариант, если звонки 1:1 не заработают (раздел 20).
 
-**Техника:** звук звонка PCM 48 кГц через `py-tgcalls` и ffmpeg; Whisper модель `small` (или `medium`, если тянет видеокарта), язык `ru`, на GPU (CUDA) или CPU int8; диск под модель до 2 ГБ. Озвученные частые фразы кэшируются.
+**Техника:** звук звонка PCM 48 кГц через `py-tgcalls` и ffmpeg; Whisper модель `base` по умолчанию (`small` или `medium`, если хватает памяти и видеокарты), язык `ru`, на GPU (CUDA) или CPU int8; диск под модель до 2 ГБ. Озвученные частые фразы кэшируются.
 
 ## 12. Анализ и зоны «дай зону»
 
@@ -530,7 +531,7 @@ HTF-уровни H4: 2650.20 / 2647.80 / 2645.30 / 2642.00
 | Диск | свободно меньше 1 ГБ | warning | сообщение раз в сутки |
 | Выходные | рынок закрыт (`status.symbol.market_open = false`) | — | тревоги «нет тиков» и «нет связи» не шлются |
 
-**Колонки `trades.csv` (v3.3):** `date_open`, `date_close` (Бишкек), `ticket`, `side`, `type` (WITH, MIXED, COUNTER, NEUTRAL), `trigger`, `mark`, `fu_class`, `score`, `zone_sources`, `zone_width`, `session`, `entry`, `sl`, `tp`, `lot`, `risk_usd`, `result_pts`, `result_usd`, `rr_real` (результат / риск), `exit` (TP, SL, BE, EARLY, FRIDAY, MANUAL, OTHER), `strength` (1–3), `weak`, `manual`, `duration_min`. Разделитель — запятая, десятичная точка, запятые внутри текста заменены пробелом.
+**Колонки `trades.csv` (v3.3):** `date_open`, `date_close` (Бишкек), `ticket`, `side`, `type` (WITH, MIXED, COUNTER, NEUTRAL), `trigger`, `mark`, `fu_class`, `score`, `zone_sources`, `zone_width`, `session`, `entry`, `sl`, `tp`, `lot`, `risk_usd`, `result_pts`, `result_usd`, `rr_real` (результат / риск), `exit` (TP, SL, BE, EARLY, FRIDAY, MANUAL, EQSTOP, OTHER), `strength` (1–3), `weak`, `manual`, `duration_min`. Разделитель — запятая, десятичная точка, запятые внутри текста заменены пробелом.
 
 **`/stats`** считает по закрытым сделкам: число, винрейт (BE не в счёте), сумма pt и денег, средний `rr_real`, profit factor (прибыль / убыток). Разбивки: по триггеру (A, B, C, D, F, S, K, E, DIRECT, MANUAL), по типу (WITH, MIXED, COUNTER), по сессии (ASIA, LONDON, NY), по силе (★, ★★, ★★★), слабые против обычных, по стороне, по выходу. Вывод — моноширинная таблица в сообщении; группы меньше 5 сделок помечены «мало данных».
 
@@ -577,7 +578,8 @@ BRIDGE_KEY=  BRIDGE_ROOT=                   пусто = Common\Files\MrCasino
 MT5_PATH=C:\Program Files\MetaTrader 5\terminal64.exe   MT5_AUTORESTART=true
 SYMBOL=                                     пусто = из статуса робота
 TZ=Asia/Bishkek  QUIET_HOURS=00:00-08:00
-VOICE=ru-RU-DmitryNeural  VOICE_TRADES=false  STT_MODEL=small  STT_DEVICE=auto
+VOICE_ENABLED=false                        голос (Whisper, озвучка, звонки): по умолчанию выключен
+VOICE=ru-RU-DmitryNeural  VOICE_TRADES=false  STT_MODEL=base  STT_DEVICE=auto
 CALL_ON_CRITICAL=true  CALL_MAX_MIN=15
 MORNING_HM=09:30  REPORT_HM=23:05  EVENING_ZONES_HM=22:30  WEEKLY=Sat 10:00
 MSG_LEVEL=1
@@ -665,3 +667,14 @@ MSG_LEVEL=1
 - [ ] Время утреннего плана, вечерних зон и отчёта: 09:30 / 22:30 / 23:05.
 
 **Проверить при разработке:** текущая поддержка звонков 1:1 в `py-tgcalls` и совместимый Telegram-клиент (шаг 2 плана); актуальные имена и цены моделей Claude на docs.claude.com; работа пакета `MetaTrader5` с уже запущенным терминалом без повторного входа; совпадение зон движка и робота на одних и тех же свечах.
+
+## Поправки после ревью (v3.4, сервер Timeweb)
+
+Сервер: Windows Server 2022, 4 ГБ RAM, 2 ядра, Амстердам; брокер, символ `GOLD#`, плечо 1:1000; сначала только демо.
+
+- **Голос выключен по умолчанию** (`VOICE_ENABLED=false`): ассистент работает текстом, без torch и Whisper; звонков нет, критичная тревога приходит сообщением. Включение: `VOICE_ENABLED=true`, `pip install -r requirements-voice.txt`, ffmpeg. Whisper по умолчанию `base`.
+- **Зависимости:** `six` в `requirements.txt`; голос вынесен в `requirements-voice.txt`; `py-tgcalls>=3.0,<4` (код звонков написан под 3.x).
+- **Робот v3.4:** жёсткий стоп по эквити `InpEquityStopUSD` (по умолчанию 0 = выключен, порог задаёт Абу); ручной вход проверяет `InpMaxSLPt`; лот по `SYMBOL_VOLUME_STEP`; `SSig` инициализируется целиком; реальный спред в событии пропуска; `InpUseM15OB=false` по умолчанию (OB на H4 и H1, M15 только для входов). Логика входов, стопа, тейка и риск по умолчанию (1% на сделку) не менялись.
+- **Самопроверка** `--selftest`: Telegram (вход, владелец, отправка), мост (папка, статус, `ping`) и MT5 проверяются отдельно, причина названа по-русски.
+- **Не сделано:** OB на Weekly и D1 (раздел 12: решает Абу); живые проверки на сервере (F7, Telegram, звонки).
+

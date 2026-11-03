@@ -1,11 +1,10 @@
-# Общие зависимости (Linux и Windows). Тесты и разработка идут на них.
+# Общие зависимости (Linux и Windows). Тесты и разработка: requirements-dev.txt (pytest там, на сервер он не ставится).
 anthropic>=1.0
 pydantic-settings>=2.4
 aiosqlite>=0.20
 pandas>=2.2
 numpy>=1.26
 mplfinance>=0.12.10b0
+six>=1.16              # mplfinance импортирует six, а python-dateutil 4.x его больше не тянет
 psutil>=6.0
 edge-tts>=6.1
-pytest>=8.0
-pytest-asyncio>=0.24

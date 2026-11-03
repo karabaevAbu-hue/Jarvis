@@ -1,0 +1,4 @@
+# Для разработки и CI: всё из requirements.txt плюс тесты. На сервер (install.bat) это не ставится.
+-r requirements.txt
+pytest>=8.0
+pytest-asyncio>=0.24

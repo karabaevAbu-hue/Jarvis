@@ -1,0 +1,30 @@
+name: tests
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - name: ffmpeg (нужен тестам озвучки)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Зависимости
+        run: pip install -r requirements-dev.txt
+      - name: Telegram и звонки (3 проверки совместимости с настоящими pyrogram и py-tgcalls 3.x)
+        run: pip install pyrofork "py-tgcalls>=3.0,<4"
+      - name: Линтер MQL5 (все mt5/*.mq5)
+        run: python -m tools.mql_lint
+      - name: pytest
+        run: python -m pytest -q
