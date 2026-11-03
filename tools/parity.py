@@ -18,6 +18,7 @@ from pathlib import Path
 import pandas as pd
 
 from agent.analysis.engine import AnalysisEngine, compare_with_robot
+from agent.analysis.robot_port import RobotParams
 
 TFS = ("M5", "M15", "H1", "H4", "D1")
 BIAS = {"BUY": 1, "SELL": -1, "NONE": 0, "NEUTRAL": 0}
@@ -29,7 +30,7 @@ def load_csv(path: Path) -> pd.DataFrame:
     return df[["open", "high", "low", "close"]].astype(float)
 
 
-def run(base: Path, tol: float = 1.0, out=print) -> int:
+def run(base: Path, tol: float = 1.0, out=print, m15_ob: bool = False) -> int:
     pdir = base / "parity"
     try:
         meta = json.loads((pdir / "meta.json").read_text(encoding="utf-8"))
@@ -44,7 +45,8 @@ def run(base: Path, tol: float = 1.0, out=print) -> int:
     status = json.loads(status_file.read_text(encoding="utf-8"))
     now = datetime.fromtimestamp(meta["now_utc"], tz=timezone.utc)
     tick = {"bid": meta["bid"], "ask": meta["ask"], "time": now}
-    eng = AnalysisEngine(None)  # type: ignore[arg-type]
+    # InpUseM15OB: у v3.4 выключен по умолчанию; для робота v3.2 / v3.3 (или если включил сам) нужен флаг --m15-ob
+    eng = AnalysisEngine(None, params=RobotParams(use_m15_ob=m15_ob))  # type: ignore[arg-type]
     res = eng.analyze_frames(raw, meta["symbol"], tick, now=now)
     robot_zones = status.get("zones", []) or []
     out(f"Символ {meta['symbol']} · bid {meta['bid']} · срез {now:%Y-%m-%d %H:%M:%S} UTC")
@@ -81,5 +83,6 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--dir", required=True, help=r"Common\Files\MrCasino (внутри папка parity)")
     ap.add_argument("--tol", type=float, default=1.0)
+    ap.add_argument("--m15-ob", action="store_true", help="у робота InpUseM15OB=true (так было в v3.2 и v3.3)")
     a = ap.parse_args()
-    sys.exit(run(Path(a.dir), a.tol))
+    sys.exit(run(Path(a.dir), a.tol, m15_ob=a.m15_ob))

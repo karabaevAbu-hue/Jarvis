@@ -29,10 +29,10 @@ TF_RANK = {"H4": 3, "H1": 2, "M15": 1}
 
 @dataclass(frozen=True)
 class RobotParams:
-    """Значения входных параметров робота v3.2 по умолчанию (в пунктах цены золота)."""
+    """Значения входных параметров робота v3.4 по умолчанию (в пунктах цены золота)."""
     zone_radius: float = 60.0         # InpZoneRadiusPt
     max_zones_side: int = 3           # InpMaxZonesSide
-    use_m15_ob: bool = True           # InpUseM15OB
+    use_m15_ob: bool = False          # InpUseM15OB: с v3.4 выключен (ТЗ: OB на Weekly–1H, M15 только для входов); у v3.2 и v3.3 был true
     ob_wick_pct: float = 45.0         # InpOBWickPct
     ob_move_bars: int = 6             # InpOBMoveBars
     ob_need_fu: bool = False          # InpOBNeedFU

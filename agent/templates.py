@@ -123,7 +123,8 @@ def trade_opened_text(d: dict, cur: str, status: Status | None) -> str:
 
 def trade_closed_text(d: dict, cur: str, status: Status | None) -> str:
     ex = d.get("exit", "")
-    head = {"TP": "✅ TP", "SL": "🔴 SL", "BE": "⚪ BE", "MANUAL": "✋ Закрыто из Telegram"}.get(ex, f"⏹ {ex}")
+    head = {"TP": "✅ TP", "SL": "🔴 SL", "BE": "⚪ BE", "MANUAL": "✋ Закрыто из Telegram",
+            "EQSTOP": "⛔ Закрыто жёстким стопом по эквити"}.get(ex, f"⏹ {ex}")
     lines = [f"{head} · {d.get('symbol', 'XAUUSD')} {d.get('side')} закрыта",
              f"{d.get('entry')} → {d.get('exit_price')} · {d.get('pts', 0):+.1f} pt · {money(d.get('usd', 0.0), cur)}",
              f"Длилась {fmt_duration(d.get('duration_min', 0))} · триггер {d.get('trigger', '—')}"]
@@ -171,6 +172,7 @@ ALERT_TITLES = {
     "algo_off": "алго-торговля выключена",
     "no_sl": "позиция без стопа",
     "orders_rejected": "3 отказа ордеров подряд, робот на паузе",
+    "equity_stop": "жёсткий стоп по эквити, позиция закрыта, робот на паузе",
     "day_dd": "просадка за день",
     "day_limit": "дневной риск исчерпан",
     "spread": "спред выше нормы",
@@ -182,4 +184,4 @@ ALERT_TITLES = {
 }
 
 # критичные ключи, на которые звонит ассистент (раздел 13)
-CRITICAL_KEYS = {"disconnect", "algo_off", "no_sl", "orders_rejected", "day_limit", "mt5_down", "robot_silent"}
+CRITICAL_KEYS = {"disconnect", "algo_off", "no_sl", "orders_rejected", "day_limit", "equity_stop", "mt5_down", "robot_silent"}

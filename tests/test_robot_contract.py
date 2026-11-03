@@ -1,4 +1,4 @@
-"""Статическая сверка робота v3.3 (mt5/MrCasino.mq5) с контрактом ТЗ и с кодом ассистента.
+"""Статическая сверка робота v3.4 (mt5/MrCasino.mq5) с контрактом ТЗ и с кодом ассистента.
 
 Компилятора MQL5 здесь нет, поэтому тест читает исходник и проверяет, что в нём есть всё, на что
 рассчитан ассистент: события, команды, тревоги, диапазоны, колонки trades.csv, ключи status.json.
@@ -18,6 +18,7 @@ from agent.bridge.protocol import BridgePaths
 ROOT = Path(__file__).resolve().parent.parent
 SRC = (ROOT / "mt5" / "MrCasino.mq5").read_text(encoding="utf-8")
 OLD = ROOT / "mt5" / "archive" / "MrCasino_v3.2.mq5"
+V33 = ROOT / "mt5" / "archive" / "MrCasino_v3.3.mq5"
 
 
 def has_key(body: str, key: str) -> bool:
@@ -33,7 +34,7 @@ def fn_body(name: str) -> str:
 
 
 def test_version_and_encoding():
-    assert '#property version   "3.30"' in SRC
+    assert '#property version   "3.40"' in SRC and SRC.count('JS("version", "3.40")') == 2
     raw = (ROOT / "mt5" / "MrCasino.mq5").read_bytes()
     assert raw[:3] != b"\xef\xbb\xbf" and b"\r" not in raw
 
@@ -43,8 +44,18 @@ def test_v32_original_is_kept_untouched():
     assert hashlib.sha256(OLD.read_bytes()).hexdigest() == "48d0347a4b5a54007b5ba702371018a912d5ad1dc76979cf6dc2baa65ac109c7"
 
 
+def test_v33_archive_is_kept_untouched():
+    import hashlib
+    assert hashlib.sha256(V33.read_bytes()).hexdigest() == "aef0c092e216230e9433284c485705dba0e5355f0b48da72b7a18d4124e78ead"
+
+
 def test_linter_is_clean():
     assert mql_lint.lint(ROOT / "mt5" / "MrCasino.mq5", OLD) == 0
+
+
+def test_linter_without_arguments_checks_every_mt5_file_without_a_reference():
+    assert mql_lint.main([]) == 0
+    assert mql_lint.main([str(ROOT / "mt5" / "MrCasino.mq5")]) == 0           # и без эталона v3.2
 
 
 @pytest.mark.parametrize("name,default", [
@@ -65,13 +76,13 @@ def test_every_event_type_of_section_7_is_emitted(etype):
 
 
 @pytest.mark.parametrize("key", ["disconnect", "algo_off", "no_sl", "orders_rejected", "day_dd", "day_limit", "spread",
-                                 "no_ticks", "margin", "friday_close"])
+                                 "no_ticks", "margin", "friday_close", "equity_stop"])
 def test_every_alert_of_section_5_8(key):
     assert f'AlertSet("{key}"' in SRC
 
 
 def test_critical_severity_matches_the_table():
-    for key in ("disconnect", "algo_off", "no_sl", "orders_rejected", "day_limit"):
+    for key in ("disconnect", "algo_off", "no_sl", "orders_rejected", "day_limit", "equity_stop"):
         assert re.search(rf'AlertSet\("{key}",[^;]*"critical"', SRC, re.S), key
     for key in ("day_dd", "spread", "no_ticks", "margin"):
         assert re.search(rf'AlertSet\("{key}",[^;]*"warning"', SRC, re.S), key
@@ -180,7 +191,7 @@ def test_trading_logic_of_v32_is_unchanged():
     same = ["IsFU", "FUClass", "Negation", "IsEngulf", "IsBodyCover", "IsLowerWick", "IsBIW", "CalcBias", "TradeType",
             "FindHTFLevels", "HtfMatch", "ZoneInFVG", "InsideFVG", "GenOB", "GenFU", "GenLiq", "CandStrength",
             "NarrowGroup", "MaxOverlap", "SelectTradable", "PruneZones", "TriggerA", "TriggerB", "TriggerC", "TriggerD",
-            "TriggerE", "TriggerF", "TriggerS", "TriggerK", "TriggerDirect", "EvalZone", "MinStopDist", "ChooseTP",
+            "TriggerE", "TriggerF", "TriggerS", "TriggerK", "TriggerDirect", "MinStopDist", "ChooseTP",
             "AdvanceNew", "CheckInvalidM15", "ReplayZone", "RebuildZones", "UpdateZoneStates", "Indecision", "ImpulseInto",
             "BEAt", "InRegion", "CheckEarlyExit", "CalcDay"]
     for name in same:
@@ -190,3 +201,161 @@ def test_trading_logic_of_v32_is_unchanged():
         if name in ("RebuildZones",):
             b = b.replace("InpTradeBuy", "g_set.tradeBuy")
         assert a == b, f"изменилась торговая логика: {name}"
+
+
+def _funcs(text: str) -> dict[str, str]:
+    pat = re.compile(r"^(?:[A-Za-z_][\w:<>&\* ]*?)\s+(\w+)\s*\(([^)]*)\)\s*\n\s*\{\n(.*?)\n  \}\n", re.S | re.M)
+    return {m.group(1): m.group(3) for m in pat.finditer(text)}
+
+
+def _changed_lines(old: str, new: str) -> set[str]:
+    import difflib
+    out = set()
+    for ln in difflib.unified_diff(old.splitlines(), new.splitlines(), lineterm="", n=0):
+        if ln.startswith(("+++", "---", "@@")):
+            continue
+        out.add(ln[0] + ln[1:].strip())
+    return out
+
+
+def test_evalzone_is_v32_logic_with_only_the_signal_init_changed():
+    a, b = _funcs(OLD.read_text(encoding="utf-8"))["EvalZone"], fn_body("EvalZone")
+    assert a.split("t.ok = false;\n", 1)[1] == b.split('string w = "";\n', 1)[1]          # все триггеры и баллы дословно
+
+
+def test_v34_changes_exactly_the_functions_that_were_asked_for():
+    """Строгий охранник «логику входов не менять»: набор изменённых функций v3.4 относительно v3.3 задан ровно."""
+    old, new = _funcs(V33.read_text(encoding="utf-8")), _funcs(SRC)
+    assert set(old) - set(new) == set(), "функции v3.3 пропали"
+    assert set(new) - set(old) == {"CheckEquityStop", "EquityBelowStop", "EquityStopText", "LotDigits", "NormLot", "SigInit"}
+    changed = {n for n in old if old[n] != new[n]}
+    assert changed == {"BridgeLine", "CalcLot", "DrawPanel", "EvalZone", "ExecCmd", "ExecOpen", "GlobalBlock", "ManagePosition",
+                       "OnInit", "OnTick", "OnTimer", "Skip", "TryEntry", "WriteStatus"}
+    # решения о входе: правки только такие
+    assert _changed_lines(old["TryEntry"], new["TryEntry"]) == {"-bs.ok = false;", "+SigInit(bs);", "+SigInit(s);"}
+    assert _changed_lines(old["CalcLot"], new["CalcLot"]) == {
+        "-lot = NormalizeDouble(lot, 2);", "+lot = NormLot(lot);",
+        '+if(lot <= 0) { why = "лот после округления по шагу символа меньше минимального"; return 0; }'}
+    assert _changed_lines(old["ManagePosition"], new["ManagePosition"]) == {
+        "-if(g_trade.PositionClosePartial(tk, NormalizeDouble(cv, 2)))", "+if(g_trade.PositionClosePartial(tk, NormLot(cv)))"}
+    assert _changed_lines(old["OnTick"], new["OnTick"]) == {"+CheckEquityStop();"}
+    gb = _changed_lines(old["GlobalBlock"], new["GlobalBlock"])
+    assert gb == {'+if(EquityBelowStop()) return "жёсткий стоп по эквити: " + EquityStopText();',
+                  '-if(spread > InpMaxSpread) return StringFormat("спред %.2f > %.2f", spread, InpMaxSpread);',
+                  '+if(spread > InpMaxSpread) return StringFormat("спред %.2f > максимума %.2f (InpMaxSpreadPt)", spread, InpMaxSpread);'}
+
+
+def test_default_risk_and_entry_limits_are_unchanged_from_v33():
+    for name in ("InpRiskMode", "InpRiskPercent", "InpDailyRiskPct", "InpMinLotIfFits", "InpMarginReserve", "InpMaxTradesDay",
+                 "InpMinSLPt", "InpMaxSLPt", "InpRR", "InpMaxSpreadPt", "InpMinScoreWith", "InpMinScoreMixed", "InpMinScoreCounter",
+                 "InpTrueStop", "InpBEFrac", "InpUseTrigA", "InpUseTrigB", "InpWeakSignals", "InpSessionStart", "InpSessionEnd"):
+        pat = rf"^input\s+\w+\s+{name}\s*=\s*([^;]+);"
+        a = re.search(pat, V33.read_text(encoding="utf-8"), re.M)
+        b = re.search(pat, SRC, re.M)
+        assert a and b and a.group(1) == b.group(1), name
+    assert re.search(r"^input\s+double\s+InpRiskPercent\s*=\s*0\.0;", SRC, re.M)      # 0 = риск в день / сделок = 1% на сделку
+    assert re.search(r"^input\s+int\s+InpMaxTradesDay\s*=\s*5;", SRC, re.M)
+    assert re.search(r"^input\s+double\s+InpDailyRiskPct\s*=\s*5\.0;", SRC, re.M)       # 5% / 5 сделок = 1%
+
+
+def _input_default(name: str) -> str:
+    m = re.search(rf"^input\s+\w+\s+{name}\s*=\s*([^;]+);", SRC, re.M)
+    assert m, name
+    return m.group(1).strip()
+
+
+def test_port_defaults_equal_robot_inputs():
+    """Сверка не должна разъезжаться из-за разных настроек: RobotParams повторяет входные параметры робота."""
+    from agent.analysis.robot_port import RobotParams
+    p = RobotParams()
+    pairs = {"zone_radius": "InpZoneRadiusPt", "max_zones_side": "InpMaxZonesSide", "use_m15_ob": "InpUseM15OB",
+             "ob_wick_pct": "InpOBWickPct", "ob_move_bars": "InpOBMoveBars", "ob_need_fu": "InpOBNeedFU",
+             "fu_zone_min_wick": "InpFUZoneMinWickPt", "sweep_zone": "InpSweepZonePt", "eq_tol": "InpEqTolPt",
+             "zone_max": "InpZoneMaxPt", "zone_min": "InpZoneMinPt", "confirm_away": "InpConfirmAwayPt",
+             "invalid_beyond": "InpInvalidBeyondPt", "zone_life_hours": "InpZoneLifeHours", "zone_life_m15": "InpZoneLifeM15",
+             "doji_body_pct": "InpDojiBodyPct", "wick_pct": "InpWickPct", "lq_min": "InpLqMinPt", "min_sl": "InpMinSLPt",
+             "max_sl": "InpMaxSLPt", "sl_buffer": "InpSLBufferPt", "true_stop": "InpTrueStop", "rr": "InpRR"}
+    for field, inp in pairs.items():
+        raw = _input_default(inp)
+        want = {"true": True, "false": False}.get(raw, None)
+        got = getattr(p, field)
+        assert (got is want) if want is not None else float(raw) == float(got), f"{field} {got!r} != {inp} {raw}"
+
+
+# ---------------------------------------------------------------- v3.4: что именно просили
+def test_m15_order_blocks_are_off_by_default_and_m15_stays_for_fu_liquidity_and_entries():
+    assert _input_default("InpUseM15OB") == "false"
+    rb = fn_body("RebuildZones")
+    assert "GenOB(PERIOD_H4, d, c);" in rb and "GenOB(PERIOD_H1, d, c);" in rb and "if(InpUseM15OB) GenOB(PERIOD_M15, d, c);" in rb
+    assert "GenFU(PERIOD_M15, d, c);" in rb and "GenLiq(PERIOD_M15, d, c);" in rb      # M15 для входов и ликвидности остаётся
+    from agent.analysis.robot_port import RobotParams
+    assert RobotParams().use_m15_ob is False
+
+
+def test_equity_stop_closes_pauses_and_alerts():
+    assert _input_default("InpEquityStopUSD") == "0.0"                    # по умолчанию выключен, робот это показывает
+    cs = fn_body("CheckEquityStop")
+    assert "InpEquityStopUSD <= 0) return" in cs
+    assert 'ClosePosNow(tk, "EQSTOP")' in cs and "g_set.paused = true;" in cs and "SaveSettings();" in cs
+    assert re.search(r'AlertSet\("equity_stop", true, "critical"', cs)
+    assert "GetTickCount64() - g_eqCloseMs >= 1000" in cs                 # повтор закрытия, пока позиция не закрыта
+    assert fn_body("EquityBelowStop").strip() == "return InpEquityStopUSD > 0 && AccountInfoDouble(ACCOUNT_EQUITY) < InpEquityStopUSD;"
+    tick, timer = fn_body("OnTick"), fn_body("OnTimer")
+    assert tick.index("CheckEquityStop();") < tick.index("ManagePosition();")     # стоп раньше сопровождения
+    assert "CheckEquityStop();" in timer                                           # и раз в секунду без тиков
+    assert "EquityBelowStop()" in fn_body("GlobalBlock") and "EquityBelowStop()" in fn_body("ExecOpen")
+    ex = fn_body("ExecCmd")
+    assert re.search(r'cmd == "resume"\)\s*\n\s*\{\n\s*if\(EquityBelowStop\(\)\)', ex)       # resume не снимает паузу ниже порога
+    assert 'EQSTOP' in SRC and "equity_stop_usd" in fn_body("WriteStatus")
+    assert "⚠️ Стоп по эквити выключен" in fn_body("BridgeLine") and "жёсткий стоп по эквити выключен" in fn_body("OnInit")
+
+
+def test_equity_stop_vocabulary_is_known_to_the_assistant():
+    from agent.notifier import EMERGENCY_PAUSE_KEYS
+    from agent.templates import ALERT_TITLES, CRITICAL_KEYS
+    assert "equity_stop" in ALERT_TITLES and "equity_stop" in CRITICAL_KEYS
+    assert "equity_stop" not in EMERGENCY_PAUSE_KEYS                    # робот паузу уже поставил сам
+
+
+def test_manual_open_checks_max_sl_like_the_automatic_entry():
+    op = fn_body("ExecOpen")
+    assert "dist > InpMaxSL" in op and "InpMaxSLPt" in op
+    assert op.index("dist > InpMaxSL") < op.index("CalcLot(")             # до расчёта лота и ордера
+    auto = fn_body("TryEntry")
+    assert "dist > InpMaxSL" in auto                                       # то же условие у автоматического входа
+    assert f"slPts > {OPEN_SL_MAX_PTS}" in op                              # общий предел 50 pt остаётся
+
+
+def test_lot_follows_symbol_volume_step():
+    nl = fn_body("NormLot")
+    for token in ("SYMBOL_VOLUME_STEP", "SYMBOL_VOLUME_MIN", "SYMBOL_VOLUME_MAX", "LotDigits(step)"):
+        assert token in nl, token
+    code = mql_lint.strip(SRC)[0]                                          # без комментариев: в них эта строка объясняется
+    assert not re.search(r"NormalizeDouble\((lot|cv),\s*2\)", code)            # жёсткие 2 знака запрещены, нужны знаки шага
+    assert "NormLot(lot)" in fn_body("CalcLot") and "NormLot(cv)" in fn_body("ManagePosition")
+    assert "step * MathPow(10.0, n)" in fn_body("LotDigits")
+
+
+def test_every_ssig_local_is_fully_initialised():
+    si = fn_body("SigInit")
+    for field in ("ok", "trig", "cls", "strong", "pts", "ext", "mark", "t"):
+        assert f"s.{field} =" in si, field
+    for m in re.finditer(r"^\s+SSig ([\w, ]+);", SRC, re.M):                      # локальные переменные SSig
+        for var in [v.strip() for v in m.group(1).split(",")]:
+            after = SRC[m.end():m.end() + 400]
+            assert f"SigInit({var});" in after, f"SSig {var} не инициализирована"
+    # struct SSig должна содержать ровно те поля, что сбрасывает SigInit
+    body = re.search(r"struct SSig\s*\{(.*?)\};", SRC, re.S).group(1)
+    fields = re.findall(r"^\s+\w+\s+(\w+);", body, re.M)
+    assert sorted(fields) == sorted(["ok", "trig", "cls", "strong", "pts", "ext", "mark", "t"])
+
+
+def test_skip_by_spread_reports_the_real_spread():
+    assert _input_default("InpMaxSpreadPt") == "0.5"                       # input на месте
+    assert "спред %.2f > максимума %.2f (InpMaxSpreadPt)" in fn_body("GlobalBlock")
+    assert "спред %.2f > максимума %.2f (InpMaxSpreadPt)" in fn_body("ExecOpen")
+    sk = fn_body("Skip")
+    assert 'JN("spread", SymbolInfoDouble(g_sym, SYMBOL_ASK) - SymbolInfoDouble(g_sym, SYMBOL_BID), 2)' in sk   # живой спред
+    assert 'JN("max_spread", InpMaxSpread, 2)' in sk and "g_curSpread" not in SRC
+    assert 'StringFind(why, "спред ") == 0' in sk                           # дрожащий спред не плодит события
+    assert "Спред сейчас" in fn_body("OnInit")                              # цифра для настройки на демо в журнале при старте

@@ -1,4 +1,4 @@
-"""Симулятор робота MT5 v3.3: пишет мост так, как его должен писать настоящий робот.
+"""Симулятор робота MT5 v3.3–v3.4: пишет мост так, как его должен писать настоящий робот.
 
 Нужен, чтобы разрабатывать и тестировать ассистента на Linux без MT5, и как эталон контракта
 для робота v3.3 (разделы 5-8 ТЗ). Торговой логики здесь нет: позиции и цены задаются вручную
@@ -55,7 +55,7 @@ class FakeEA:
         self.connected = True
         self._ticket = 123456
         self._status_at = 0.0
-        self.version = "3.30"
+        self.version = "3.40"
 
     # ---------- жизненный цикл ----------
     def start(self) -> None:
@@ -115,7 +115,7 @@ class FakeEA:
             "terminal": {"connected": self.connected, "algo_allowed": True, "ea_trade_allowed": True, "ping_ms": 41},
             "account": {"login": self.login, "server": "Exness-MT5Trial", "currency": "USD", "mode": "demo",
                         "balance": round(self.balance, 2), "equity": round(eq, 2), "margin_free": 980.1,
-                        "margin_level": 4200.0},
+                        "margin_level": 4200.0, "equity_stop_usd": 0.0},
             "symbol": {"name": self.symbol, "bid": self.bid, "ask": self.ask,
                        "spread": round(self.ask - self.bid, 2), "last_tick_utc": iso_z(now), "market_open": True},
             "session": {"open": True, "name": "LONDON", "relaxed": True},
@@ -343,7 +343,7 @@ def _demo_step(ea: FakeEA, rnd: random.Random) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Симулятор робота MrCasino v3.3 (мост)")
+    ap = argparse.ArgumentParser(description="Симулятор робота MrCasino v3.4 (мост)")
     ap.add_argument("--root", default="data/bridge")
     ap.add_argument("--robot", default="12345678_777001")
     ap.add_argument("--key", default="test-key")

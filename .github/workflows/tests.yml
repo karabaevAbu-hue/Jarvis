@@ -20,5 +20,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Зависимости
         run: pip install -r requirements.txt
+      - name: Telegram и звонки (3 проверки совместимости с настоящими pyrogram и py-tgcalls 3.x)
+        run: pip install pyrofork "py-tgcalls>=3.0,<4"
+      - name: Линтер MQL5 (все mt5/*.mq5)
+        run: python -m tools.mql_lint
       - name: pytest
         run: python -m pytest -q

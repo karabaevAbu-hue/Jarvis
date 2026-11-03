@@ -8,7 +8,11 @@
  4. функция использована раньше определения без прототипа (в MQL5 лучше этого избегать);
  5. отсутствие `\\r` и непарных `"` в строках.
 
-    python -m tools.mql_lint mt5/MrCasino.mq5 --reference path/to/MrCasino_v32.mq5
+    python -m tools.mql_lint                       # без аргументов: все mt5/*.mq5
+    python -m tools.mql_lint mt5/MrCasino.mq5      # один файл
+    python -m tools.mql_lint mt5/MrCasino.mq5 --reference mt5/archive/MrCasino_v3.2.mq5   # вызовы эталона считаются известными
+
+Встроенные функции MQL5 заданы списком BUILTINS ниже, поэтому --reference нужен только как дополнительная страховка.
 """
 from __future__ import annotations
 
@@ -23,18 +27,69 @@ KEYWORDS = {"if", "for", "while", "switch", "return", "sizeof", "else", "do", "c
 TYPES = r"(?:void|bool|int|uint|long|ulong|short|ushort|char|uchar|double|float|string|datetime|color|" \
         r"ENUM_\w+|SDay|SZone|SSig|SCand|SSet|MqlRates)"
 
-# встроенные функции MQL5, которые добавлены в v3.3 (проверены по документации MQL5)
-EXTRA_BUILTINS = """
-FolderCreate FileOpen FileClose FileSize FileSeek FileWriteArray FileReadArray FileMove FileDelete FileFindFirst
-FileFindNext FileFindClose StringToCharArray CharArrayToString StringGetCharacter ShortToString StringToDouble
-StringToInteger TimeToStruct MathIsValidNumber ObjectsTotal ObjectName ObjectGetInteger ObjectGetDouble ObjectCreate
-ObjectSetInteger ChartID ChartOpen ChartClose ChartRedraw ChartGetInteger ChartScreenShot Sleep EventSetTimer
-EventKillTimer GetTickCount64 TerminalInfoInteger AccountInfoInteger SymbolInfoSessionTrade StringReplace
-StringSubstr StringFind StringLen StringFormat IntegerToString DoubleToString ArrayResize ArraySize NormalizeDouble
-MathAbs MathMax MathMin MathRound MathFloor PositionGetInteger PositionGetDouble PositionGetString TimeGMT TimeCurrent
-SendNotification WebRequest Print GetLastError SymbolInfoDouble SymbolInfoInteger AccountInfoDouble AccountInfoString
-ObjectFind ObjectDelete ObjectSetDouble ObjectSetString ObjectsDeleteAll Comment MQLInfoInteger EnumToString FileIsExist FileCopy
-""".split()
+# Встроенные функции MQL5 (документация MQL5 Reference), по разделам. Метод вызывается через точку (g_trade.Buy) и
+# линтер его не проверяет. Функциональные приведения типов (int(x), double(x)) тоже считаются известными.
+_BUILTIN_GROUPS = {
+    "математика": """MathAbs MathArccos MathArcsin MathArctan MathCeil MathCos MathExp MathFloor MathLog MathLog10 MathMax
+        MathMin MathMod MathPow MathRand MathRound MathSin MathSqrt MathSrand MathTan MathIsValidNumber MathExpm1 MathLog1p
+        MathSinh MathCosh MathTanh MathArcsinh MathArccosh MathArctanh MathSwap MathClassify""",
+    "строки": """StringAdd StringBufferLen StringCompare StringConcatenate StringFill StringFind StringFormat StringGetCharacter
+        StringInit StringLen StringReplace StringSetCharacter StringSplit StringSubstr StringToLower StringToUpper
+        StringTrimLeft StringTrimRight StringToCharArray StringToShortArray StringToColor StringToDouble StringToInteger
+        StringToTime CharArrayToString ShortArrayToString CharToString ShortToString CharArrayToStruct StructToCharArray""",
+    "преобразования": """CharToString ColorToARGB ColorToString DoubleToString EnumToString IntegerToString NormalizeDouble
+        StringToTime TimeToString TimeToStruct StructToTime""",
+    "массивы": """ArrayBsearch ArrayCompare ArrayCopy ArrayFill ArrayFree ArrayGetAsSeries ArrayInitialize ArrayInsert
+        ArrayIsDynamic ArrayIsSeries ArrayMaximum ArrayMinimum ArrayPrint ArrayRange ArrayRemove ArrayResize ArrayReverse
+        ArraySetAsSeries ArraySize ArraySort ArraySwap ArrayToFP16 ArrayToFP8 ArrayFromFP16 ArrayFromFP8""",
+    "время": """TimeCurrent TimeLocal TimeGMT TimeGMTOffset TimeDaylightSavings TimeTradeServer Day DayOfWeek DayOfYear Hour
+        Minute Month Seconds TimeDay TimeDayOfWeek TimeDayOfYear TimeHour TimeMinute TimeMonth TimeSeconds TimeYear Year""",
+    "счёт и терминал": """AccountInfoDouble AccountInfoInteger AccountInfoString TerminalInfoDouble TerminalInfoInteger
+        TerminalInfoString MQLInfoInteger MQLInfoString MQLSetInteger""",
+    "общие": """Alert CheckPointer Comment CryptDecode CryptEncode DebugBreak ExpertRemove GetPointer MessageBox PeriodSeconds
+        Print PrintFormat ResetLastError SendFTP SendMail SendNotification Sleep TerminalClose WebRequest GetTickCount
+        GetTickCount64 GetMicrosecondCount SetUserError GetLastError ZeroMemory IsStopped UninitializeReason
+        TesterStatistics TesterStop TesterDeposit TesterWithdrawal SocketCreate SocketClose SocketConnect SocketSend
+        SocketRead SocketIsConnected SocketIsReadable SocketIsWritable SocketTimeouts SocketTlsHandshake SocketTlsRead
+        SocketTlsSend SocketTlsCertificate SocketTlsReadAvailable""",
+    "символы и рынок": """SymbolsTotal SymbolName SymbolSelect SymbolIsSynchronized SymbolInfoDouble SymbolInfoInteger
+        SymbolInfoString SymbolInfoMarginRate SymbolInfoTick SymbolInfoSessionQuote SymbolInfoSessionTrade MarketBookAdd
+        MarketBookGet MarketBookRelease Symbol Period Digits Point""",
+    "таймсерии": """SeriesInfoInteger Bars BarsCalculated CopyBuffer CopyRates CopyTime CopyOpen CopyHigh CopyLow CopyClose
+        CopyTickVolume CopyRealVolume CopySpread CopyTicks CopyTicksRange iBars iBarShift iClose iHigh iLow iOpen iTime
+        iTickVolume iRealVolume iVolume iSpread iHighest iLowest""",
+    "торговля и история": """OrderCalcMargin OrderCalcProfit OrderCheck OrderSend OrderSendAsync PositionsTotal PositionGetSymbol
+        PositionSelect PositionSelectByTicket PositionGetDouble PositionGetInteger PositionGetString PositionGetTicket
+        OrdersTotal OrderGetTicket OrderSelect OrderGetDouble OrderGetInteger OrderGetString HistorySelect
+        HistorySelectByPosition HistoryOrderSelect HistoryOrdersTotal HistoryOrderGetTicket HistoryOrderGetDouble
+        HistoryOrderGetInteger HistoryOrderGetString HistoryDealSelect HistoryDealsTotal HistoryDealGetTicket
+        HistoryDealGetDouble HistoryDealGetInteger HistoryDealGetString""",
+    "индикаторы": """iAC iAD iADX iADXWilder iAlligator iAMA iAO iATR iBands iBearsPower iBullsPower iBWMFI iCCI iChaikin
+        iCustom iDEMA iDeMarker iEnvelopes iForce iFractals iFrAMA iGator iIchimoku iMA iMACD iMFI iMomentum iOBV iOsMA iRSI
+        iRVI iSAR iStdDev iStochastic iTEMA iTriX iVIDyA iVolumes iWPR IndicatorRelease IndicatorCreate IndicatorParameters
+        SetIndexBuffer IndicatorSetDouble IndicatorSetInteger IndicatorSetString IndicatorBuffers PlotIndexSetDouble
+        PlotIndexSetInteger PlotIndexSetString PlotIndexGetInteger""",
+    "файлы": """FileClose FileCopy FileDelete FileFindClose FileFindFirst FileFindNext FileFlush FileGetInteger FileIsEnding
+        FileIsExist FileIsLineEnding FileMove FileOpen FileOpenHistory FileReadArray FileReadBool FileReadDatetime
+        FileReadDouble FileReadFloat FileReadInteger FileReadLong FileReadNumber FileReadString FileReadStruct FileSeek
+        FileSize FileTell FileWrite FileWriteArray FileWriteDouble FileWriteFloat FileWriteInteger FileWriteLong
+        FileWriteString FileWriteStruct FileLoad FileSave FolderClean FolderCreate FolderDelete FileSelectDialog""",
+    "глобальные переменные": """GlobalVariableCheck GlobalVariableDel GlobalVariableGet GlobalVariableName
+        GlobalVariablesDeleteAll GlobalVariablesFlush GlobalVariablesTotal GlobalVariableSet GlobalVariableSetOnCondition
+        GlobalVariableTemp GlobalVariableTime""",
+    "график": """ChartApplyTemplate ChartClose ChartFirst ChartGetDouble ChartGetInteger ChartGetString ChartID
+        ChartIndicatorAdd ChartIndicatorDelete ChartIndicatorGet ChartIndicatorName ChartIndicatorsTotal ChartNavigate
+        ChartNext ChartOpen ChartPeriod ChartPriceOnDropped ChartRedraw ChartSaveTemplate ChartScreenShot ChartSetDouble
+        ChartSetInteger ChartSetString ChartSetSymbolPeriod ChartSymbol ChartTimePriceToXY ChartTimeOnDropped
+        ChartWindowFind ChartWindowOnDropped ChartXOnDropped ChartXYToTimePrice ChartYOnDropped ChartWindowsHandle""",
+    "объекты": """ObjectCreate ObjectDelete ObjectFind ObjectGetDouble ObjectGetInteger ObjectGetString ObjectGetTimeByValue
+        ObjectGetValueByTime ObjectMove ObjectName ObjectSetDouble ObjectSetInteger ObjectSetString ObjectsDeleteAll
+        ObjectsTotal TextSetFont TextOut TextGetSize""",
+    "события": """EventChartCustom EventKillTimer EventSetMillisecondTimer EventSetTimer""",
+    "приведения типов": """bool char uchar short ushort int uint long ulong float double string datetime color""",
+}
+BUILTINS = {n for group in _BUILTIN_GROUPS.values() for n in group.split()}
+EXTRA_BUILTINS = sorted(BUILTINS)          # прежнее имя оставлено для совместимости
 
 
 def macros(code: str) -> set[str]:
@@ -164,7 +219,7 @@ def calls(skel: str):
 
 
 def lint(path: Path, reference: Path | None) -> int:
-    code = path.read_text(encoding="utf-8")
+    code = path.read_bytes().decode("utf-8")          # read_text превращает \r\n в \n, и проверка ниже никогда бы не сработала
     problems: list[str] = []
     if "\r" in code:
         problems.append("в файле есть \\r (ожидаются LF)")
@@ -175,7 +230,7 @@ def lint(path: Path, reference: Path | None) -> int:
     if reference:
         rskel, _ = strip(reference.read_text(encoding="utf-8"))
         rdefs = definitions(rskel)
-        rcode = reference.read_text(encoding="utf-8")
+        rcode = reference.read_bytes().decode("utf-8")
         known |= {n for n, _, _ in calls(rskel)} | set(rdefs) | macros(rcode)
     first_use: dict[str, int] = {}
     for name, line, nargs in calls(skel):
@@ -196,9 +251,22 @@ def lint(path: Path, reference: Path | None) -> int:
     return 1 if problems else 0
 
 
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("file")
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Линтер MQL5: без аргументов проверяет все mt5/*.mq5")
+    ap.add_argument("files", nargs="*", help="файлы .mq5; пусто = mt5/*.mq5 рядом с проектом")
     ap.add_argument("--reference", help="рабочий эталон (например v3.2): его вызовы считаются известными")
-    a = ap.parse_args()
-    sys.exit(lint(Path(a.file), Path(a.reference) if a.reference else None))
+    a = ap.parse_args(argv)
+    root = Path(__file__).resolve().parent.parent
+    files = [Path(f) for f in a.files] or sorted((root / "mt5").glob("*.mq5"))
+    if not files:
+        print("✖ не найдено ни одного .mq5 (ожидается mt5/*.mq5)")
+        return 1
+    ref = Path(a.reference) if a.reference else None
+    worst = 0
+    for f in files:
+        worst = max(worst, lint(f, ref))
+    return worst
+
+
+if __name__ == "__main__":
+    sys.exit(main())

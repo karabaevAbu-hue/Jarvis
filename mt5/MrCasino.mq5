@@ -12,13 +12,18 @@
 //|   таймер, команды из Telegram (после «да» ассистента), тревоги,  |
 //|   скрины, настройки g_set. Торговая логика не менялась.          |
 //|                                                                  |
+//|   v3.4: жёсткий стоп по эквити (InpEquityStopUSD), ручной вход   |
+//|   проверяет InpMaxSL, лот по шагу символа, OB на M15 выключен    |
+//|   по умолчанию (ТЗ: OB на Weekly–1H), спред в событиях пропуска. |
+//|   Правила входа, стопа, тейка и риск по умолчанию не менялись.   |
+//|                                                                  |
 //|   Единицы: 1 пункт = $1 цены золота (пороги в ценовых единицах). |
 //|   Внутри паттерны и зоны считаются для BUY ("бычья логика");     |
 //|   для SELL цены зеркалятся (аксессоры Ov/Hv/Lv/Cv с d = -1).     |
 //+------------------------------------------------------------------+
 #property copyright "Consigliere"
-#property version   "3.30"
-#property description "Mr. Casino v3.3 (золото, мост с ассистентом): зоны OB/FU/ликвидность -> манипуляция A-D, F, S + свечи из книги (K) -> стоп True Stop, тейк RR 1:2, 5 сделок в день, риск 5% в день"
+#property version   "3.40"
+#property description "Mr. Casino v3.4 (золото, мост с ассистентом): зоны OB/FU/ликвидность -> манипуляция A-D, F, S + свечи из книги (K) -> стоп True Stop, тейк RR 1:2, 5 сделок в день, риск 5% в день"
 
 #include <Trade\Trade.mqh>
 
@@ -43,6 +48,7 @@ input double          InpRiskPercent    = 0.0;          // % баланса на
 input double          InpDailyRiskPct   = 5.0;          // Риск в день: макс. убыток за день, % баланса (0 = выкл)
 input bool            InpMinLotIfFits   = true;         // Лот по риску меньше минимального — мин. лот, если влезает в дневной риск
 input double          InpMarginReserve  = 30.0;         // Запас свободной маржи, %
+input double          InpEquityStopUSD  = 0.0;          // Жёсткий стоп по эквити, в валюте счёта: эквити ниже порога — закрыть позицию, пауза, тревога (0 = выкл)
 
 input group "Направления и баллы [§4, §6.2]"
 input bool            InpTradeBuy       = true;         // Разрешить BUY
@@ -56,7 +62,7 @@ input int             InpRepeatM15Bars  = 2;            // Пауза после
 input group "Зоны [§6]"
 input double          InpZoneRadiusPt   = 60.0;         // Радиус поиска зон от цены, пунктов
 input int             InpMaxZonesSide   = 3;            // Зон на сторону
-input bool            InpUseM15OB       = true;         // OB на M15
+input bool            InpUseM15OB       = false;        // OB на M15 (по ТЗ OB размечают на Weekly–1H, M15 и ниже только для входов; true = как в v3.2/v3.3)
 input double          InpOBWickPct      = 45.0;         // Макс. сумма теней свечи OB, %
 input int             InpOBMoveBars     = 6;            // Свечей на уход цены от OB
 input bool            InpOBNeedFU       = false;        // FU после OB обязателен
@@ -330,6 +336,7 @@ ulong      g_lastAlertMs  = 0;
 string     g_lastMorningDay = "";
 string     g_lastReportDay  = "";
 int        g_noSlTries    = 0;
+ulong      g_eqCloseMs    = 0;          // v3.4: когда последний раз пытались закрыть позицию по стопу эквити
 datetime   g_noSlLast     = 0;
 bool       g_biasInit     = false;
 bool       g_zoneCreating = false;   // зона создаётся: zone_invalid не шлём
@@ -1929,6 +1936,12 @@ int TrigPts(string trig, bool strong)
    return 0;
   }
 
+// Все поля заданы: без этого компилятор предупреждает о возможном использовании неинициализированной структуры
+void SigInit(SSig &s)
+  {
+   s.ok = false; s.trig = ""; s.cls = 0; s.strong = false; s.pts = 0; s.ext = 0.0; s.mark = ""; s.t = 0;
+  }
+
 void FillSig(SSig &s, string trig, int cls, bool strong, double ext, string mark, datetime t)
   {
    s.ok = true; s.trig = trig; s.cls = cls; s.strong = strong; s.ext = ext; s.mark = mark; s.t = t;
@@ -2286,11 +2299,12 @@ bool TriggerDirect(const SZone &z, const MqlRates &r[], SSig &s)
 
 bool EvalZone(SZone &z, const MqlRates &r[], SSig &s, string &why)
   {
-   s.ok = false; s.pts = 0; s.cls = 0; s.trig = ""; s.ext = 0; s.mark = ""; s.t = 0; s.strong = false;
+   SigInit(s);
    SSig best, t;
-   best.ok = false; best.pts = -1;
+   SigInit(best);
+   SigInit(t);
+   best.pts = -1;
    string w = "";
-   t.ok = false;
    if(InpUseTrigB && TriggerB(z, r, t, w))
      {
       z.hasHCS = true;
@@ -2383,6 +2397,41 @@ double DailyRiskLeft()
    return DayStartBalance() * g_set.dailyRiskPct / 100.0 - MathMax(0.0, -g_day.usd);
   }
 
+// Жёсткий стоп по эквити [v3.4]: эквити ниже InpEquityStopUSD
+bool EquityBelowStop()
+  {
+   return InpEquityStopUSD > 0 && AccountInfoDouble(ACCOUNT_EQUITY) < InpEquityStopUSD;
+  }
+
+string EquityStopText()
+  {
+   return StringFormat("эквити %.2f %s ниже жёсткого стопа %.2f", AccountInfoDouble(ACCOUNT_EQUITY),
+                       AccountInfoString(ACCOUNT_CURRENCY), InpEquityStopUSD);
+  }
+
+// Знаков после запятой у шага лота: 0.01 -> 2, 0.001 -> 3, 0.1 -> 1, 1 -> 0
+int LotDigits(double step)
+  {
+   int n = 0;
+   while(n < 8 && MathAbs(step * MathPow(10.0, n) - MathRound(step * MathPow(10.0, n))) > 1e-9) n++;
+   return n;
+  }
+
+// Лот по правилам символа [v3.4]: вниз до шага SYMBOL_VOLUME_STEP, не больше SYMBOL_VOLUME_MAX; 0, если меньше SYMBOL_VOLUME_MIN.
+// NormalizeDouble(lot, 2) для этого не годится: при шаге 0.001 теряет знак, при шаге 0.05 даёт лот вне сетки.
+double NormLot(double lot)
+  {
+   double step = SymbolInfoDouble(g_sym, SYMBOL_VOLUME_STEP);
+   double minv = SymbolInfoDouble(g_sym, SYMBOL_VOLUME_MIN);
+   double maxv = SymbolInfoDouble(g_sym, SYMBOL_VOLUME_MAX);
+   if(step <= 0) step = 0.01;
+   if(minv <= 0) minv = step;
+   lot = MathFloor(lot / step + 1e-9) * step;
+   if(maxv > 0 && lot > maxv) lot = MathFloor(maxv / step + 1e-9) * step;
+   if(lot < minv - 1e-12) return 0.0;
+   return NormalizeDouble(lot, LotDigits(step));
+  }
+
 // Лот [§2]: по риску на сделку, но не больше остатка дневного риска. Если лот по риску меньше
 // минимального — минимальный лот, когда он влезает в дневной риск (InpMinLotIfFits).
 // Возвращает 0 и причину в why, если сделку открыть нельзя; riskUsd — риск сделки в валюте счёта.
@@ -2434,7 +2483,8 @@ double CalcLot(double slDist, int d, double entry, double &riskUsd, string &why,
       double m = 0;
       if(OrderCalcMargin(ot, g_sym, lot, entry, m) && m * (1.0 + InpMarginReserve / 100.0) <= free)
         {
-         lot = NormalizeDouble(lot, 2);
+         lot = NormLot(lot);
+         if(lot <= 0) { why = "лот после округления по шагу символа меньше минимального"; return 0; }
          riskUsd = lot * lossPerLot;
          return lot;
         }
@@ -2627,7 +2677,7 @@ void DrawPanel()
                   : StringFormat("тейк %.0f–%.0f (LAL, RR от %.1f)", InpTPMin, InpTPMax, InpMinRR);
    string mode = Relaxed() ? (g_set.weak ? " · слабые сигналы вкл." : " · добор") : "";
    if(g_set.cWeak) mode += " (TG)";
-   Comment("Mr. Casino v3.3 (золото)\n", BridgeLine(),
+   Comment("Mr. Casino v3.4 (золото)\n", BridgeLine(),
            "Bias: D1=", BiasName(g_d1), "  H4=", BiasName(g_h4), "\n",
            "Сессия: ", InSession() ? "открыта" : "закрыта", " (Бишкек ", LocalHM(), ")", mode, "\n",
            "SELL-зона: ", NearestZoneText(-1), "\n",
@@ -2646,6 +2696,7 @@ void DrawPanel()
 string GlobalBlock()
   {
    if(g_set.paused) return "пауза (" + g_pauseReason + ")";
+   if(EquityBelowStop()) return "жёсткий стоп по эквити: " + EquityStopText();
    if(HasPos()) return "позиция уже открыта";
    if(FridayCloseTime()) return "пятница, закрытие рынка";
    if(!InSession()) return "вне сессии (Бишкек " + LocalHM() + ")";
@@ -2657,7 +2708,7 @@ string GlobalBlock()
       return StringFormat("дневной риск %.1f%% исчерпан (%.2f за день), пауза до завтра", g_set.dailyRiskPct, g_day.usd);
    if(NewsBlock()) return "окно новостей";
    double spread = SymbolInfoDouble(g_sym, SYMBOL_ASK) - SymbolInfoDouble(g_sym, SYMBOL_BID);
-   if(spread > InpMaxSpread) return StringFormat("спред %.2f > %.2f", spread, InpMaxSpread);
+   if(spread > InpMaxSpread) return StringFormat("спред %.2f > максимума %.2f (InpMaxSpreadPt)", spread, InpMaxSpread);
    return "";
   }
 
@@ -2665,14 +2716,18 @@ string GlobalBlock()
 void Skip(int zi, string why, bool hadSignal = false)
   {
    g_lastSkip = why;
-   if(g_zones[zi].lastSkip == why && TimeCurrent() - g_zones[zi].lastSkipT < 1800) return;
-   g_zones[zi].lastSkip = why;
+   // спред дрожит, и каждая новая цифра была бы новым событием: повтор по спреду считаем одной причиной
+   string key = StringFind(why, "спред ") == 0 ? "спред выше максимума" : why;
+   if(g_zones[zi].lastSkip == key && TimeCurrent() - g_zones[zi].lastSkipT < 1800) return;
+   g_zones[zi].lastSkip = key;
    g_zones[zi].lastSkipT = TimeCurrent();
    Lg(1, "Пропуск " + ZoneTag(g_zones[zi]) + ": " + why);
    bool sig = hadSignal || g_sigThisPass;
    Emit(sig ? "signal_skipped" : "analysis_skip", sig ? 1 : 2, "info",
         JS("dir", DirName(g_zones[zi].dir)) + "," + JN("lo", g_zones[zi].lo, g_digits) + "," + JN("hi", g_zones[zi].hi, g_digits) + "," +
-        JS("why", why), (sig ? "⏭ Пропуск " : "· Нет триггера ") + ZoneTag(g_zones[zi]) + ": " + why, -1);
+        JS("why", why) + "," + JN("spread", SymbolInfoDouble(g_sym, SYMBOL_ASK) - SymbolInfoDouble(g_sym, SYMBOL_BID), 2) + "," +
+        JN("max_spread", InpMaxSpread, 2),
+        (sig ? "⏭ Пропуск " : "· Нет триггера ") + ZoneTag(g_zones[zi]) + ": " + why, -1);
   }
 
 // Книга: Doji или волчок (spinning top) — нерешительность, вход через свечу. По стратегии свеча,
@@ -2724,7 +2779,7 @@ void TryEntry()
    string gblock = GlobalBlock();
    int bi = -1, bpts = -1, btype = T_NEUTRAL;
    SSig bs;
-   bs.ok = false;
+   SigInit(bs);
    for(int i = 0; i < ArraySize(g_zones); i++)
      {
       if(g_zones[i].status != ZONE_CONFIRMED || !g_zones[i].tradable) continue;
@@ -2743,6 +2798,7 @@ void TryEntry()
       if(ll > 0 && TimeCurrent() - ll < (long)InpRepeatM15Bars * PeriodSeconds(PERIOD_M15))
         { Skip(i, StringFormat("повтор %s после стопа раньше %d свечей M15", DirName(d), InpRepeatM15Bars)); continue; }
       SSig s;
+      SigInit(s);
       string why = "";
       if(!EvalZone(g_zones[i], r, s, why)) { Skip(i, why); continue; }
       g_sigThisPass = true;
@@ -2886,6 +2942,39 @@ void ClosePosNow(ulong tk, string tag)
    g_exitTag = tag;
    if(!g_trade.PositionClose(tk))
       Print("Закрытие не удалось: ", g_trade.ResultRetcode(), " ", g_trade.ResultRetcodeDescription());
+  }
+
+// Жёсткий стоп по эквити [v3.4]: закрыть позицию, поставить паузу, поднять критичную тревогу.
+// Вызывается на каждом тике и раз в секунду из таймера. Пауза сама не снимается: resume отказывает, пока эквити ниже порога.
+void CheckEquityStop()
+  {
+   if(InpEquityStopUSD <= 0) return;
+   if(!EquityBelowStop())
+     {
+      if(AlertIsOn("equity_stop"))
+         AlertSet("equity_stop", false, "critical",
+                  StringFormat("Эквити %.2f снова выше жёсткого стопа %.2f. Робот остаётся на паузе до команды resume.",
+                               AccountInfoDouble(ACCOUNT_EQUITY), InpEquityStopUSD));
+      return;
+     }
+   string why = EquityStopText();
+   if(!g_set.paused)
+     {
+      g_set.paused = true;
+      g_pauseReason = "жёсткий стоп по эквити: " + why;
+      SaveSettings();
+      Lg(0, "ЖЁСТКИЙ СТОП ПО ЭКВИТИ: " + why + ". Позиция закрывается, робот на паузе.");
+     }
+   if(!AlertIsOn("equity_stop"))                // текст собираем один раз, а не на каждом тике
+      AlertSet("equity_stop", true, "critical",
+               "Жёсткий стоп по эквити: " + why + ". Позиция закрывается, робот поставлен на паузу, новые входы остановлены. "
+               "Проверь счёт: пауза снимется командой resume только когда эквити поднимется выше порога.");
+   ulong tk; long id; int d; double vol, op, sl, tp;
+   if(FindPos(tk, id, d, vol, op, sl, tp) && GetTickCount64() - g_eqCloseMs >= 1000)   // повтор раз в секунду, пока не закрыта
+     {
+      g_eqCloseMs = GetTickCount64();
+      ClosePosNow(tk, "EQSTOP");
+     }
   }
 
 void OnPositionClosed()
@@ -3059,7 +3148,7 @@ void ManagePosition()
       double cv = MathFloor(vol / 2.0 / step + 1e-9) * step;
       if(cv >= minv && vol - cv >= minv - 1e-12)
         {
-         if(g_trade.PositionClosePartial(tk, NormalizeDouble(cv, 2)))
+         if(g_trade.PositionClosePartial(tk, NormLot(cv)))
            {
             g_partDone = true;
             Emit("trade_partial", 0, "info", JI("ticket", g_pId) + "," + JN("closed_lot", cv, 2) + "," + JN("left_lot", vol - cv, 2),
@@ -3155,7 +3244,7 @@ void WriteStatus()
    double left = g_set.dailyRiskPct > 0 ? DailyRiskLeft() : 0.0;
    long pingUs = (long)TerminalInfoInteger(TERMINAL_PING_LAST);
    ENUM_RISK_MODE rm = EffectiveRiskMode();
-   string s = "{" + JI("schema", 1) + "," + JS("robot", g_robotId) + "," + JS("version", "3.30") + "," +
+   string s = "{" + JI("schema", 1) + "," + JS("robot", g_robotId) + "," + JS("version", "3.40") + "," +
               JS("ts_utc", IsoUtc(TimeGMT())) + "," + JS("ts_local", LocalStamp(LocalNow())) + ",";
    s += "\"terminal\":{" + JB("connected", (bool)TerminalInfoInteger(TERMINAL_CONNECTED)) + "," +
         JB("algo_allowed", (bool)TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) + "," +
@@ -3164,7 +3253,7 @@ void WriteStatus()
         JS("currency", AccountInfoString(ACCOUNT_CURRENCY)) + "," + JS("mode", modeS) + "," +
         JN("balance", AccountInfoDouble(ACCOUNT_BALANCE), 2) + "," + JN("equity", AccountInfoDouble(ACCOUNT_EQUITY), 2) + "," +
         JN("margin_free", AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2) + "," +
-        JN("margin_level", AccountInfoDouble(ACCOUNT_MARGIN_LEVEL), 1) + "},";
+        JN("margin_level", AccountInfoDouble(ACCOUNT_MARGIN_LEVEL), 1) + "," + JN("equity_stop_usd", InpEquityStopUSD, 2) + "},";
    s += "\"symbol\":{" + JS("name", g_sym) + "," + JN("bid", bid, g_digits) + "," + JN("ask", ask, g_digits) + "," +
         JN("spread", ask - bid, 2) + "," + JS("last_tick_utc", IsoUtc(lastTick - GmtOffset())) + "," +
         JB("market_open", SymbolSessionOpen()) + "},";
@@ -3390,14 +3479,16 @@ bool ExecOpen(const string &k[], const string &v[], string &msg)
    if(!hSl || slPts <= 0 || slPts > 50.0) { msg = "стоп обязателен: от 0 до 50 пунктов"; return false; }
    if(hRisk && (riskArg < 0.1 || riskArg > 5.0)) { msg = "риск на сделку: допустимо от 0.1 до 5"; return false; }
    if(hRr && (rrArg < 1.0 || rrArg > 5.0)) { msg = "RR: допустимо от 1 до 5"; return false; }
+   if(EquityBelowStop()) { msg = "жёсткий стоп по эквити: " + EquityStopText(); return false; }
    if(HasPos()) { msg = "позиция уже открыта"; return false; }
    if(FridayCloseTime()) { msg = "пятница, закрытие рынка"; return false; }
    if(g_day.trades >= g_set.maxTrades) { msg = StringFormat("лимит сделок дня %d исчерпан", g_set.maxTrades); return false; }
    if(g_set.dailyRiskPct > 0 && DailyRiskLeft() <= 0) { msg = "дневной риск исчерпан"; return false; }
    double ask = SymbolInfoDouble(g_sym, SYMBOL_ASK), bid = SymbolInfoDouble(g_sym, SYMBOL_BID);
-   if(ask - bid > InpMaxSpread) { msg = StringFormat("спред %.2f > %.2f", ask - bid, InpMaxSpread); return false; }
+   if(ask - bid > InpMaxSpread) { msg = StringFormat("спред %.2f > максимума %.2f (InpMaxSpreadPt)", ask - bid, InpMaxSpread); return false; }
    int d = side == "BUY" ? 1 : -1;
    double dist = slPts;
+   if(dist > InpMaxSL) { msg = StringFormat("стоп %.1f больше максимального %.1f (InpMaxSLPt), как и у автоматического входа", dist, InpMaxSL); return false; }
    if(dist < MinStopDist()) { msg = StringFormat("стоп %.1f меньше стоп-уровня брокера", dist); return false; }
    double rr = hRr ? rrArg : g_set.rr;
    double entry = d > 0 ? ask : bid;
@@ -3461,6 +3552,7 @@ bool ExecCmd(string cmd, const string &k[], const string &v[], string &msg, int 
      }
    if(cmd == "resume")
      {
+      if(EquityBelowStop()) { msg = "паузу снять нельзя: " + EquityStopText() + ". Пополни счёт или измени InpEquityStopUSD"; return false; }
       g_set.paused = false;
       g_pauseReason = "";
       g_rejectStreak = 0;
@@ -3627,6 +3719,7 @@ void ProcessCommands()
 void OnTimer()
   {
    if(!g_bridgeOn) return;
+   CheckEquityStop();                          // и без тиков: раз в секунду
    ProcessCommands();
    ulong ms = GetTickCount64();
    if(ms - g_lastStatusMs >= (ulong)MathMax(1, InpStatusSec) * 1000)
@@ -3649,6 +3742,7 @@ string BridgeLine()
   {
    string s = "";
    if(g_set.paused) s += "ПАУЗА (" + g_pauseReason + ")\n";
+   if(InpEquityStopUSD <= 0) s += "⚠️ Стоп по эквити выключен (InpEquityStopUSD = 0)\n";
    if(!g_bridgeOn) return s + "Бот: мост выключен\n";
    if(InpBridgeKey == "") s += "⚠️ InpBridgeKey пуст: команды не принимаются\n";
    if(g_botAlive) s += "Бот: онлайн\n";
@@ -3753,6 +3847,13 @@ int OnInit()
                       InpBEFrac, g_set.maxTrades, g_set.weak ? "вкл" : "выкл (добор с " + InpQuotaFrom + ")"));
    Print(StringFormat("Риск: %.2f%% на сделку, в день до %.1f%% баланса%s", TradeRiskPct(EffectiveRiskMode()), g_set.dailyRiskPct,
                       EffectiveRiskMode() == RISK_FIXED ? " (режим FIXED: лот " + DoubleToString(InpFixedLot, 2) + ", дневной лимит действует)" : ""));
+   if(InpEquityStopUSD > 0)
+      Print(StringFormat("Жёсткий стоп по эквити: %.2f %s (сейчас эквити %.2f)", InpEquityStopUSD, AccountInfoString(ACCOUNT_CURRENCY),
+                         AccountInfoDouble(ACCOUNT_EQUITY)));
+   else
+      Print("Внимание: жёсткий стоп по эквити выключен (InpEquityStopUSD = 0). Задай порог в валюте счёта, ниже которого робот закроет позицию и встанет на паузу.");
+   Print(StringFormat("Спред сейчас %.2f, максимум для входа %.2f (InpMaxSpreadPt). Если входы пропускаются по спреду, подними InpMaxSpreadPt по этой цифре.",
+                      SymbolInfoDouble(g_sym, SYMBOL_ASK) - SymbolInfoDouble(g_sym, SYMBOL_BID), InpMaxSpread));
    g_sessStart = ParseHM(InpSessionStart);
    g_sessEnd = ParseHM(InpSessionEnd);
    g_londonMin = ParseHM(InpLondonStart);
@@ -3774,15 +3875,15 @@ int OnInit()
    g_lastM5 = 0; g_lastM15 = 0; g_lastH1 = 0;
    g_day = CalcDay();
    ManagePosition();
-   Print("Mr. Casino v3.3 запущен: ", g_sym, ", риск ", EnumToString(EffectiveRiskMode()), ", магик ", InpMagic,
+   Print("Mr. Casino v3.4 запущен: ", g_sym, ", риск ", EnumToString(EffectiveRiskMode()), ", магик ", InpMagic,
          ", лог-уровень ", InpLogLevel, ", Бишкек ", LocalHM());
    if(g_bridgeOn)
      {
       EventSetTimer(1);
-      Emit("ea_started", 0, "info", JS("version", "3.30") + "," + JI("login", AccountInfoInteger(ACCOUNT_LOGIN)) + "," + JS("symbol", g_sym) + "," +
+      Emit("ea_started", 0, "info", JS("version", "3.40") + "," + JI("login", AccountInfoInteger(ACCOUNT_LOGIN)) + "," + JS("symbol", g_sym) + "," +
            JN("risk_pct", TradeRiskPct(EffectiveRiskMode()), 2) + "," + JN("daily_risk_pct", g_set.dailyRiskPct, 2) + "," +
            JI("max_trades", g_set.maxTrades) + "," + JN("rr", g_set.rr, 2),
-           StringFormat("▶️ Робот запущен: v3.3 · %s · %s · %s · риск %g%% / %g%% в день", g_sym, AccountInfoString(ACCOUNT_SERVER),
+           StringFormat("▶️ Робот запущен: v3.4 · %s · %s · %s · риск %g%% / %g%% в день", g_sym, AccountInfoString(ACCOUNT_SERVER),
                         AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_REAL ? "реальный счёт" : "демо",
                         TradeRiskPct(EffectiveRiskMode()), g_set.dailyRiskPct), -1);
      }
@@ -3803,6 +3904,7 @@ void OnDeinit(const int reason)
 void OnTick()
   {
    g_lastTickMs = GetTickCount64();
+   CheckEquityStop();
    ManagePosition();
    datetime t = iTime(g_sym, PERIOD_M5, 0);
    if(t == 0) return;

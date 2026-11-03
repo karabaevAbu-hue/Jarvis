@@ -163,6 +163,26 @@ async def test_emergency_pause_without_yes_only_for_open_critical_alert(nw, path
     assert paused == []
 
 
+async def test_equity_stop_alert_is_critical_calls_and_does_not_double_pause(nw):
+    """v3.4: робот сам закрыл позицию и встал на паузу. Ассистент звонит, но второй паузы без «да» не ставит."""
+    n, m, caller, ea, clock, paused, hub = nw
+    ea.open_position("BUY", 5.5)
+    data = {"key": "equity_stop", "state": "open", "severity": "critical"}
+    await n.on_event(ev("alert", severity="critical", data=data,
+                        text="Жёсткий стоп по эквити: эквити 85.00 USD ниже жёсткого стопа 90.00."))
+    await asyncio.sleep(0.05)
+    assert "ТРЕВОГА" in m.sent[0]["outs"][0].text and "эквити" in m.sent[0]["outs"][0].text and m.sent[0]["silent"] is False
+    assert len(caller.calls) == 1 and "жёсткий стоп по эквити" in caller.calls[0][1].lower()
+    assert paused == []
+
+
+def test_equity_stop_exit_has_its_own_headline():
+    from agent.templates import trade_closed_text
+    txt = trade_closed_text({"exit": "EQSTOP", "side": "BUY", "entry": 4300.0, "exit_price": 4290.5, "pts": -9.5,
+                             "usd": -9.5, "duration_min": 12, "trigger": "A"}, "USD", None)
+    assert txt.startswith("⛔ Закрыто жёстким стопом по эквити") and "EQSTOP" not in txt
+
+
 async def test_ack_stops_calls(nw, db):
     n, m, caller, *_ = nw
     await n.on_event(ev("alert", severity="critical", data={"key": "algo_off", "state": "open", "severity": "critical"}, text="x"))
