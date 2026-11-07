@@ -12,7 +12,18 @@ from aiogram.client.session.base import BaseSession
 from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendMessage
 from aiogram.types import CallbackQuery, Chat, Message, Update, User
 
-from app.bot import BTN_GROUPS, BTN_ORDERS, BTN_SETTINGS, BTN_START, BTN_STATUS, BTN_TEST, Deps, build_router
+from app.bot import (
+    BTN_GROUPS,
+    BTN_ORDERS,
+    BTN_PAUSE,
+    BTN_SETTINGS,
+    BTN_START,
+    BTN_STATUS,
+    BTN_STOP_ALL,
+    BTN_TEST,
+    Deps,
+    build_router,
+)
 from app.config import Config
 
 OWNER = 1001
@@ -209,3 +220,32 @@ async def test_test_send(panel, db, api, engine):
 async def test_fallback_for_unknown_text(panel):
     texts = await panel(text_update(OWNER, "привет"))
     assert "Не понял" in texts[0]
+
+
+@pytest.mark.parametrize(
+    "button", [BTN_STOP_ALL, BTN_PAUSE, BTN_STATUS, BTN_GROUPS, BTN_START, BTN_SETTINGS, BTN_TEST]
+)
+async def test_menu_button_during_order_input_is_not_saved_as_order(panel, db, button):
+    """Кнопка меню посреди ввода заказа срабатывает как кнопка. Иначе её подпись станет текстом заказа и уйдёт в WhatsApp."""
+    await db.set_order(1, "Заказ", OWNER)
+    await panel(callback_update(OWNER, "o:set:2"))  # бот ждёт текст заказа №2
+    await panel(text_update(OWNER, button))
+    assert [o["slot"] for o in await db.active_orders()] == [1]
+
+
+async def test_stop_all_works_during_order_input(panel, db, engine):
+    await db.sync_groups([("1@g.us", "Ош логистика")])
+    await db.set_group_enabled("1@g.us", True)
+    await db.set_order(1, "Заказ", OWNER)
+    await engine.start()
+    await panel(callback_update(OWNER, "o:set:2"))
+    texts = await panel(text_update(OWNER, BTN_STOP_ALL))
+    assert any("Всё остановлено" in t for t in texts)
+    assert await db.get("running") == "0"
+
+
+async def test_set_command_during_order_input_is_not_saved_as_order(panel, db):
+    await panel(callback_update(OWNER, "o:set:2"))
+    texts = await panel(text_update(OWNER, "/set live 20"))
+    assert "раз в 20 мин" in texts[0]
+    assert await db.active_orders() == []

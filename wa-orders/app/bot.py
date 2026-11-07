@@ -215,7 +215,6 @@ def build_router(deps: Deps) -> Router:
             return ""
         return tg_html_to_wa(message.html_text)
 
-    @router.message(OrderInput.one)
     async def order_one_input(message: Message, state: FSMContext):
         text = _order_text(message)
         if not text:
@@ -234,7 +233,6 @@ def build_router(deps: Deps) -> Router:
         view, keyboard = await orders_view()
         await message.answer(f"Заказ №{slot} сохранён.{note}\n\n{view}", reply_markup=keyboard)
 
-    @router.message(OrderInput.all)
     async def order_all_input(message: Message, state: FSMContext):
         blocks = split_orders(_order_text(message))
         if not blocks:
@@ -591,6 +589,11 @@ def build_router(deps: Deps) -> Router:
             if handler:
                 handler.release()
         await message.answer_document(BufferedInputFile(data, filename="bot.log"), caption="Последняя часть лога")
+
+    # Ввод заказа регистрируем ПОСЛЕ кнопок меню и команд: aiogram берёт первый подошедший хендлер, и иначе
+    # «🛑 Стоп всё» или /set посреди ввода заказа сохранились бы как его текст и ушли бы в группы WhatsApp.
+    router.message.register(order_one_input, OrderInput.one)
+    router.message.register(order_all_input, OrderInput.all)
 
     @router.message()
     async def fallback(message: Message):

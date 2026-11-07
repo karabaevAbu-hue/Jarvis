@@ -161,6 +161,24 @@ async def test_timeout_and_not_sent_retries_once(db, engine, api, clock):
     assert await db.stats_since(0) == {"not_sent": 1, "queued": 1}
 
 
+async def test_timeout_but_message_still_in_queue_no_duplicate(db, engine, api, clock):
+    """ТЗ, раздел 6: после таймаута сверяем журнал И очередь. Сообщение ещё в очереди — повтор дал бы дубль."""
+    await prepare(db, groups=1)
+    await engine.start()
+    chat_id = (await db.enabled_groups())[0]["chat_id"]
+
+    async def timeout_after_enqueue(target, text):
+        api.queue.append({"body": {"chatId": target, "message": text}, "type": "sendMessage"})
+        raise GreenAPIError("sendMessage", body="timeout", network=True)
+
+    api.send_message = timeout_after_enqueue
+    await engine.step()
+    for task in list(engine._background):
+        await task
+    assert await db.stats_since(0) == {"queued": 1}
+    assert (await db.get_group(chat_id))["next_send_at"] >= clock.now + 900  # повтора нет
+
+
 async def test_three_failures_disable_group(db, engine, api, notifier, clock):
     await prepare(db, groups=1)
     await engine.start()

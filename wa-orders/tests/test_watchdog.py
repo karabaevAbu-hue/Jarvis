@@ -1,6 +1,18 @@
+import asyncio
+
 from app.watchdog import Watchdog, ensure_instance_settings
 
 from .conftest import add_groups
+
+_REAL_SLEEP = asyncio.sleep  # в тестах ниже asyncio.sleep подменяется, ждать условия надо настоящим
+
+
+async def wait_until(predicate, timeout=2.0):
+    for _ in range(int(timeout / 0.005)):
+        if predicate():
+            return True
+        await _REAL_SLEEP(0.005)
+    return False
 
 
 def make_watchdog(api, db, engine, notifier, runtime, clock):
@@ -77,6 +89,57 @@ async def test_delivery_statuses_update_log(api, db, engine, notifier, runtime, 
     wd = make_watchdog(api, db, engine, notifier, runtime, clock)
     await wd.handle({"typeWebhook": "outgoingMessageStatus", "idMessage": "M2", "status": "delivered"})
     assert await db.stats_since(0) == {"delivered": 1}
+
+
+async def test_state_loop_survives_unexpected_error(api, db, engine, notifier, runtime, clock):
+    """Сторож не должен молча умирать от неожиданного сбоя: иначе бан номера останется незамеченным."""
+    calls = 0
+
+    async def flaky_state():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ValueError("неожиданный ответ")
+        return "blocked"
+
+    api.get_state = flaky_state
+    task = asyncio.create_task(make_watchdog(api, db, engine, notifier, runtime, clock).run_state())
+    try:
+        assert await wait_until(lambda: runtime.wa_state == "blocked")
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_notifications_loop_survives_unexpected_error(api, db, engine, notifier, runtime, clock, monkeypatch):
+    async def no_wait(delay, *args):  # паузы повтора (10–30 с) в тесте не ждём
+        await _REAL_SLEEP(0)
+
+    monkeypatch.setattr(asyncio, "sleep", no_wait)
+    calls, deleted = 0, []
+
+    async def flaky_receive(wait_seconds=20):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ValueError("неожиданный ответ")
+        if calls == 2:
+            return {"receiptId": 7, "body": {"typeWebhook": "stateInstanceChanged", "stateInstance": "blocked"}}
+        await _REAL_SLEEP(0.005)  # дальше уведомлений нет
+        return None
+
+    async def delete_notification(receipt_id):
+        deleted.append(receipt_id)
+
+    api.receive_notification = flaky_receive
+    api.delete_notification = delete_notification
+    task = asyncio.create_task(make_watchdog(api, db, engine, notifier, runtime, clock).run_notifications())
+    try:
+        assert await wait_until(lambda: deleted == [7])
+        assert runtime.wa_state == "blocked"
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 async def test_sync_groups_counts_new_and_gone(db):

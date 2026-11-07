@@ -295,12 +295,20 @@ class Engine:
         await asyncio.sleep(self.verify_delay)
         try:
             items = await self.api.last_outgoing(minutes=15)
+            queue = await self.api.show_queue()  # ТЗ, раздел 6: сообщение могло ещё не дойти до журнала
         except GreenAPIError as exc:
-            log.warning("Не удалось проверить журнал исходящих: %s. Повтор не делаем, чтобы не было дубля", exc)
+            log.warning("Не удалось проверить журнал исходящих и очередь: %s. Повтор не делаем, чтобы не было дубля", exc)
             return
         for item in items:
             if item.get("chatId") == chat_id and _text_of(item) == text.strip():
                 await self.db.log_update(log_id, "queued", id_message=str(item.get("idMessage", "")))
+                return
+        for item in queue:
+            body = item.get("body") if isinstance(item, dict) else None
+            if not isinstance(body, dict):
+                continue
+            if body.get("chatId") == chat_id and str(body.get("message") or "").strip() == text.strip():
+                await self.db.log_update(log_id, "queued")  # сообщение ещё в очереди GREEN-API, повтор дал бы дубль
                 return
         await self.db.log_update(log_id, "not_sent")
         if await self.db.get("running") == "1":

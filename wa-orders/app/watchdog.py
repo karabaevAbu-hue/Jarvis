@@ -86,16 +86,23 @@ class Watchdog:
     async def run_state(self) -> None:
         while True:
             try:
-                state = await self.api.get_state()
-            except GreenAPIError as exc:
-                log.warning("Не удалось получить состояние номера: %s", exc)
-                if exc.bad_credentials and not self._creds_alerted:
-                    self._creds_alerted = True
-                    await self.notifier.owner("⛔ GREEN-API не принял idInstance или токен. Проверьте .env.")
-            else:
-                self._creds_alerted = False
-                await self.apply_state(state)
+                await self._poll_state()
+            except Exception:
+                # Сторож не должен молча умирать: иначе бан или отвязка номера останутся незамеченными.
+                log.exception("Сбой сторожа номера, продолжаю опрос")
             await asyncio.sleep(self.poll_seconds)
+
+    async def _poll_state(self) -> None:
+        try:
+            state = await self.api.get_state()
+        except GreenAPIError as exc:
+            log.warning("Не удалось получить состояние номера: %s", exc)
+            if exc.bad_credentials and not self._creds_alerted:
+                self._creds_alerted = True
+                await self.notifier.owner("⛔ GREEN-API не принял idInstance или токен. Проверьте .env.")
+        else:
+            self._creds_alerted = False
+            await self.apply_state(state)
 
     async def apply_state(self, state: str) -> None:
         old = self.runtime.wa_state
@@ -154,6 +161,10 @@ class Watchdog:
                 item = await self.api.receive_notification(20)
             except GreenAPIError as exc:
                 await asyncio.sleep(10 if exc.network else 30)
+                continue
+            except Exception:
+                log.exception("Сбой при получении уведомлений GREEN-API, повтор через 30 с")
+                await asyncio.sleep(30)
                 continue
             if not item:
                 continue
